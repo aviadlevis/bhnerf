@@ -1,0 +1,3 @@
+[submodule "kgeo"]
+	path = kgeo
+	url = https://github.com/achael/kgeo
