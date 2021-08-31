@@ -1,11 +1,15 @@
+import jax 
+from jax import jit, random
 from flax import linen as nn
 from typing import Any, Callable
+import functools
 import numpy as np
 import jax.numpy as jnp
+import emission_utils
 
 class MLP(nn.Module):
     """A simple MLP."""
-
+    
     net_depth: int = 4
     net_width: int = 256
     activation: Callable[..., Any] = nn.elu
@@ -44,43 +48,61 @@ class MLP(nn.Module):
 
         return out
 
-class PREDICT_EMISSION(nn.Module):
+class PREDICT_EMISSION_2D(nn.Module):
     """Full function to predict emission at a time step."""
-
+    posenc_deg: int = 3
+    
     @nn.compact
-    def __call__(self, x, y, t):
+    def __call__(self, x, y, t, v):
 
         emission_MLP = MLP()
 
-        def predict_emission(x, y, t):
+        def predict_emission(x, y, t, v):
     
-            radius = jnp.sqrt(x**2 + y**2)
-            theta = jnp.arctan2(y, x)
-
-            theta_rot = theta - 2 * jnp.pi * t / orbit_period * radius**(-3/2)
-            x_rot = radius * jnp.cos(theta_rot)
-            y_rot = radius * jnp.sin(theta_rot)
-
-            net_input = jnp.stack([x_rot, y_rot], axis=-1)
+            net_input = emission_utils.velocity_warp_2d(x, y, t, v, jax=True)
             valid_inputs_mask = jnp.isfinite(net_input)
             net_input = jnp.where(valid_inputs_mask, net_input, jnp.zeros_like(net_input))
-            net_output = emission_MLP(posenc(net_input, posenc_deg))
+            net_output = emission_MLP(posenc(net_input, self.posenc_deg))
             emission = nn.sigmoid(net_output[..., 0])
             emission = jnp.where(valid_inputs_mask[..., 0], emission, jnp.zeros_like(emission))
 
             # Ground truth emission
-            # radius_gt = 3.5
-            # theta_gt = np.pi / 2.
-            # center = [radius_gt * jnp.cos(theta_gt), radius_gt * jnp.sin(theta_gt)]
-            # std = 0.4
-            # emission = jnp.exp(-0.5*( (y_rot - center[1])**2 + (x_rot - center[0])**2 ) / std**2)
-            # emission = jnp.where(jnp.isfinite(emission), emission, jnp.zeros_like(emission))
+#             radius_gt = 3.5
+#             theta_gt = np.pi / 2.
+#             center = [radius_gt * jnp.sin(theta_gt), radius_gt * jnp.cos(theta_gt)]
+#             std = 0.4
+#             emission = jnp.exp(-0.5*( (net_input[..., 1] - center[1])**2 + (net_input[..., 0] - center[0])**2 ) / std**2)
+#             emission = jnp.where(jnp.isfinite(emission), emission, jnp.zeros_like(emission))
 
             return emission
 
-        emission = predict_emission(x, y, t)
+        emission = predict_emission(x, y, t, v)
 
         return emission
+    
+    def lossfn(self, params, x, y, d, t, v, target, key):
+        emission = self.apply({'params': params}, x, y, t, v)
+        valid_d_mask = jnp.isfinite(d)
+        d = jnp.where(valid_d_mask, d, jnp.zeros_like(d))
+        rendering = jnp.sum(emission * d, axis=-1)
+        loss = jnp.mean((rendering - target)**2)
+        return loss, [emission, rendering]
+
+    @functools.partial(jit, static_argnums=(0, 1))
+    def train_step(self, v, i, x, y, d, t, target, state, key):
+        key, new_key = random.split(key)
+        vals, grads = jax.value_and_grad(self.lossfn, argnums=(0), has_aux=True)(state.params, x, y, d, t, v, target, new_key)
+        grads = jax.lax.pmean(grads, axis_name='batch')
+        state = state.apply_gradients(grads=grads)
+        loss, [emission, rendering] = vals
+        return loss, state, emission, rendering, new_key
+
+    @functools.partial(jit, static_argnums=(0, 1))
+    def eval_step(self, v, i, x, y, d, t, target, state, key):
+        key, new_key = random.split(key)
+        vals, grads = jax.value_and_grad(self.lossfn, argnums=(0), has_aux=True)(state.params, x, y, d, t, v, target, new_key)
+        loss, [emission, rendering] = vals
+        return loss, state, emission, rendering, new_key
 
 def safe_sin(x):
     """jnp.sin() on a TPU will NaN out for moderately large values."""

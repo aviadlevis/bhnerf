@@ -2,6 +2,7 @@ import utils
 import numpy as np
 import xarray as xr
 import skimage.transform
+from inspect import signature
 
 def gaussian_2d(ny, nx, std, fwhm=None, fov=(1.0, 'unitless'), center=(0,0), std_clip=np.inf):
     """
@@ -81,11 +82,11 @@ def generate_orbit_2d(initial_frame, nt, velocity_field):
     movie = []
     fovx = (initial_frame.x.max() - initial_frame.x.min()).data
     fovy = (initial_frame.y.max() - initial_frame.y.min()).data
-    npix = (initial_frame.x.size, initial_frame.y.size)
-    x, y = np.meshgrid(initial_frame.x, initial_frame.y) 
-    for t in np.linspace(0.0, 1.0, nt): 
+    npix = (initial_frame.y.size, initial_frame.x.size)
+    y, x = np.meshgrid(initial_frame.y, initial_frame.x, indexing='ij')
+    for t in np.linspace(0.0, 1.0, nt):
         warped_coords = velocity_warp_2d(x, y, t, velocity_field)
-        image_coords = world_to_image_coords(warped_coords, fov=(fovx, fovy), npix=npix).T
+        image_coords = np.moveaxis(world_to_image_coords(warped_coords, fov=(fovy, fovx), npix=npix), -1, 0)
         frame_data = skimage.transform.warp(initial_frame, image_coords, mode='constant', cval=0.0)
         frame = xr.DataArray(frame_data, dims=['y', 'x'], coords={'t': t, 'y': initial_frame.y, 'x':initial_frame.x})
         
@@ -103,11 +104,27 @@ def velocity_warp_2d(x, y, t, velocity_field, jax=False):
     radius = _np.sqrt(x**2 + y**2) 
     theta = _np.arctan2(y, x)
     
-    theta_rot = theta - 2 * np.pi * t * velocity_field
+    if _np.isscalar(velocity_field):
+        velocity = velocity_field
+        
+    elif callable(velocity_field):
+        args = {}
+        params = signature(velocity_field).parameters.keys()
+        if ('radius' in params): args['radius'] = radius
+        if ('theta' in params): args['theta'] = theta
+        if ('r' in params): args['r'] = radius
+        if ('x' in params): args['x'] = x
+        if ('y' in params): args['y'] = y
+        velocity = velocity_field(**args)
+        
+    elif isinstance(velocity_field, xr.DataArray):
+        velocity = velocity_field.interp(x=xr.DataArray(x).fillna(0.0), y=xr.DataArray(y).fillna(0.0)).data
+  
+    theta_rot = theta - 2 * np.pi * t * velocity
 
     x_rot = radius * _np.cos(theta_rot)
     y_rot = radius * _np.sin(theta_rot)
-    warped_coords = _np.stack([x_rot, y_rot], axis=-1)
+    warped_coords = _np.stack([y_rot, x_rot], axis=-1)
     return warped_coords
 
 def integrate_rays(medium, sensor, dim='geo'):
