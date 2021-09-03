@@ -18,8 +18,6 @@ def gaussian_2d(ny, nx, std, fwhm=None, fov=(1.0, 'unitless'), center=(0,0), std
         Gaussian full width half max. Overrides the std parameter.
     fov: (float, str), default=(1.0, 'unitless')
         Field of view and units. Default is unitless 1.0.
-    total_flux: float, default=1.0,
-        Total flux normalization of the image (sum over pixels).
     center: tuple, default=(0,0)
         Center of the gaussian in the image coordinates ('y', 'x')
     std_clip: float, default=np.inf
@@ -45,7 +43,6 @@ def gaussian_2d(ny, nx, std, fwhm=None, fov=(1.0, 'unitless'), center=(0,0), std
         coords=grid.coords,
         dims=['y', 'x'],
         attrs={
-            'envelope_model': 'gaussian',
             'fov': fov,
             'std': std,
             'fwhm': fwhm,
@@ -53,7 +50,56 @@ def gaussian_2d(ny, nx, std, fwhm=None, fov=(1.0, 'unitless'), center=(0,0), std
             'std_clip': std_clip
         })
     return image
-  
+
+def gaussian_3d(nx, ny, nz, std,  fwhm=None, fov=(1.0, 'uniless'), center=(0,0,0), std_clip=np.inf):
+    """
+    Gaussian image.
+
+    Parameters
+    ----------
+    nx, ny, nz: int,
+            Number of (x/y/z)-axis grid points.
+    std: float,
+        Gaussian standard deviation. Used if fwhm is not specified.
+    fwhm: float, optional,
+        Gaussian full width half max. Overrides the std parameter.
+    fov: (float, str), default=(1.0, 'unitless')
+        Field of view and units. Default is unitless 1.0.
+    center: tuple, default=(0,0,0)
+        Center of the gaussian in the image coordinates ('x', 'y', 'z')
+    std_clip: float, default=np.inf
+        Clip after this number of standard deviations
+
+    Returns
+    -------
+    image: xr.DataArray,
+        An image DataArray with dimensions ['x', 'y', 'z'].
+    """
+    if fwhm is None:
+        fwhm = 2 * np.sqrt(2 * np.log(2)) * std
+    else:
+        std = fwhm / (2 * np.sqrt(2 * np.log(2)))
+
+    start = (-fov[0] / 2.0, -fov[0] / 2.0, -fov[0] / 2.0)
+    stop = (fov[0] / 2.0, fov[0] / 2.0, fov[0] / 2.0)
+    grid = utils.linspace_3d((nx, ny, nz), start, stop, units=fov[1])
+    
+    data = np.exp(-0.5*( (grid.x - center[0])**2 + (grid.y - center[1])**2 + (grid.z - center[2])**2 ) / std**2)
+    threshold = np.exp(-0.5 * std_clip ** 2)
+    image = xr.DataArray(
+        name='emission',
+        data=data.where(data > threshold).fillna(0.0),
+        coords=grid.coords,
+        dims=['x', 'y', 'z'],
+        attrs={
+            'fov': fov,
+            'std': std,
+            'fwhm': fwhm,
+            'center': center,
+            'std_clip': std_clip
+        })
+    return image
+
 def generate_hotspots_2d(ny, nx, theta, orbit_radius, std, r_isco=3, fov=(10.0, 'GM/c^2'), std_clip=3, normalize=True):
     
     if np.any(orbit_radius < r_isco):
@@ -67,6 +113,26 @@ def generate_hotspots_2d(ny, nx, theta, orbit_radius, std, r_isco=3, fov=(10.0, 
     for theta, orbit_radius, std in zip(thetas, orbit_radii, stds):
         x, y = orbit_radius * np.array([np.cos(theta), np.sin(theta)])
         hotspot = gaussian_2d(ny, nx, std, fov=fov, center=(y, x), std_clip=std_clip)
+        initial_frame += hotspot
+    if normalize:
+        initial_frame /= initial_frame.max()
+        
+    return initial_frame
+
+def generate_hotspots_3d(nx, ny, nz, theta, phi, orbit_radius, std, r_isco=3, fov=(10.0, 'GM/c^2'), std_clip=3, normalize=True):
+    
+    if np.any(orbit_radius < r_isco):
+        raise AttributeError('hotspot center ({}) is is within r_isco: {}'.format(orbit_radius, r_isco))
+        
+    thetas = np.atleast_1d(theta)
+    phis = np.atleast_1d(phi)
+    orbit_radii = np.atleast_1d(orbit_radius)
+    stds = np.atleast_1d(std)
+    initial_frame = np.zeros([nx, ny, nz])
+    
+    for theta, phi, orbit_radius, std in zip(thetas, phis, orbit_radii, stds):
+        x, y, z = orbit_radius * np.array([np.cos(phi)*np.sin(theta), np.sin(phi)*np.sin(theta), np.cos(theta)])
+        hotspot = gaussian_3d(nx, ny, nz, std, fov=fov, center=(x, y, z), std_clip=std_clip)
         initial_frame += hotspot
     if normalize:
         initial_frame /= initial_frame.max()
@@ -89,7 +155,23 @@ def generate_orbit_2d(initial_frame, nt, velocity_field):
         image_coords = np.moveaxis(world_to_image_coords(warped_coords, fov=(fovy, fovx), npix=npix), -1, 0)
         frame_data = skimage.transform.warp(initial_frame, image_coords, mode='constant', cval=0.0)
         frame = xr.DataArray(frame_data, dims=['y', 'x'], coords={'t': t, 'y': initial_frame.y, 'x':initial_frame.x})
-        
+        movie.append(frame.expand_dims('t'))
+    movie = xr.concat(movie, dim='t')
+    return movie
+
+def generate_orbit_3d(initial_frame, nt, velocity_field, rot_axis):
+    movie = []
+    fovx = (initial_frame.x.max() - initial_frame.x.min()).data
+    fovy = (initial_frame.y.max() - initial_frame.y.min()).data
+    fovz = (initial_frame.z.max() - initial_frame.z.min()).data
+    npix = (initial_frame.x.size, initial_frame.y.size, initial_frame.z.size)
+    x, y, z = np.meshgrid(initial_frame.x, initial_frame.y, initial_frame.z, indexing='ij')
+    for t in np.linspace(0.0, 1.0, nt):
+        warped_coords = velocity_warp_3d(x, y, z, t, velocity_field, rot_axis)
+        image_coords = np.moveaxis(world_to_image_coords(warped_coords, fov=(fovx, fovy, fovz), npix=npix), -1, 0)
+        frame_data = skimage.transform.warp(initial_frame, image_coords, mode='constant', cval=0.0)
+        frame = xr.DataArray(frame_data, dims=['x', 'y', 'z'], 
+                             coords={'t': t, 'x':initial_frame.x, 'y': initial_frame.y, 'z': initial_frame.z})
         movie.append(frame.expand_dims('t'))
     movie = xr.concat(movie, dim='t')
     return movie
@@ -125,6 +207,37 @@ def velocity_warp_2d(x, y, t, velocity_field, jax=False):
     x_rot = radius * _np.cos(theta_rot)
     y_rot = radius * _np.sin(theta_rot)
     warped_coords = _np.stack([y_rot, x_rot], axis=-1)
+    return warped_coords
+
+def velocity_warp_3d(x, y, z, t, velocity_field, rot_axis, jax=False):
+
+    if jax: 
+        import jax.numpy as _np
+    else: 
+        _np = np
+    
+    radius = _np.sqrt(x**2 + y**2 + z**2) 
+
+    if _np.isscalar(velocity_field):
+        velocity = velocity_field
+        theta_rot = 2 * np.pi * t * velocity
+        rot_matrix = utils.rotation_matrix(rot_axis, theta_rot)
+        warped_coords = np.dot(rot_matrix, np.stack((x, y, z), axis=2))
+
+    elif callable(velocity_field):
+        args = {}
+        params = signature(velocity_field).parameters.keys()
+        if ('radius' in params): args['radius'] = radius
+        if ('theta' in params): args['theta'] = theta
+        if ('r' in params): args['r'] = radius
+        if ('x' in params): args['x'] = x
+        if ('y' in params): args['y'] = y
+        velocity = velocity_field(**args)
+        theta_rot = 2 * np.pi * t * velocity
+        rot_matrix = utils.rotation_matrix(rot_axis, theta_rot)
+        warped_coords = np.sum(rot_matrix * np.stack((x, y, z)), axis=1)
+
+    warped_coords = np.moveaxis(warped_coords, 0, -1)
     return warped_coords
 
 def integrate_rays(medium, sensor, dim='geo'):
