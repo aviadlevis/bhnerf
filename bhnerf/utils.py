@@ -75,7 +75,7 @@ def linspace_3d(num, start=(-0.5, -0.5, -0.5), stop=(0.5, 0.5, 0.5), endpoint=(T
     
     return grid.utils_polar.add_coords(image_dims=['x','y','z'])
 
-def rotation_matrix(axis, angle):
+def rotation_matrix(axis, angle, jax=False):
     """
     Return the rotation matrix associated with counterclockwise rotation about
     the given axis
@@ -86,6 +86,8 @@ def rotation_matrix(axis, angle):
         Axis of rotation
     angle: float or numpy array of floats,
         Angle of rotation in radians
+    jax: bool, default=False
+        Compuatations using jax.
         
     Returns
     -------
@@ -97,15 +99,20 @@ def rotation_matrix(axis, angle):
     [1] https://en.wikipedia.org/wiki/Euler%E2%80%93Rodrigues_formula
     [2] https://stackoverflow.com/questions/6802577/rotation-of-3d-vector
     """
-    axis = np.array(axis)
-    axis = axis / np.sqrt(np.dot(axis, axis))
-    a = np.cos(angle / 2.0)
-    b, c, d = np.stack([-ax * np.sin(angle / 2.0) for ax in axis])
+    if jax: 
+        import jax.numpy as _np
+    else: 
+        _np = np
+    
+    axis = _np.array(axis)
+    axis = axis / _np.sqrt(_np.dot(axis, axis))
+    a = _np.cos(angle / 2.0)
+    b, c, d = _np.stack([-ax * _np.sin(angle / 2.0) for ax in axis])
     aa, bb, cc, dd = a * a, b * b, c * c, d * d
     bc, ad, ac, ab, bd, cd = b * c, a * d, a * c, a * b, b * d, c * d
-    return np.array([[aa + bb - cc - dd, 2 * (bc + ad), 2 * (bd - ac)],
-                     [2 * (bc - ad), aa + cc - bb - dd, 2 * (cd + ab)],
-                     [2 * (bd + ac), 2 * (cd - ab), aa + dd - bb - cc]])
+    return _np.array([[aa + bb - cc - dd, 2 * (bc + ad), 2 * (bd - ac)],
+                      [2 * (bc - ad), aa + cc - bb - dd, 2 * (cd + ab)],
+                      [2 * (bd + ac), 2 * (cd - ab), aa + dd - bb - cc]])
 
 
 @xr.register_dataset_accessor("utils_polar")

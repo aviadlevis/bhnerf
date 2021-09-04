@@ -202,7 +202,7 @@ def velocity_warp_2d(x, y, t, velocity_field, jax=False):
     elif isinstance(velocity_field, xr.DataArray):
         velocity = velocity_field.interp(x=xr.DataArray(x).fillna(0.0), y=xr.DataArray(y).fillna(0.0)).data
   
-    theta_rot = theta - 2 * np.pi * t * velocity
+    theta_rot = theta - 2 * _np.pi * t * velocity
 
     x_rot = radius * _np.cos(theta_rot)
     y_rot = radius * _np.sin(theta_rot)
@@ -220,9 +220,9 @@ def velocity_warp_3d(x, y, z, t, velocity_field, rot_axis, jax=False):
 
     if _np.isscalar(velocity_field):
         velocity = velocity_field
-        theta_rot = 2 * np.pi * t * velocity
-        rot_matrix = utils.rotation_matrix(rot_axis, theta_rot)
-        warped_coords = np.dot(rot_matrix, np.stack((x, y, z), axis=2))
+        theta_rot = 2 * _np.pi * t * velocity
+        rot_matrix = utils.rotation_matrix(rot_axis, theta_rot, jax=jax)
+        warped_coords = _np.dot(rot_matrix, _np.stack((x, y, z), axis=2))
 
     elif callable(velocity_field):
         args = {}
@@ -233,11 +233,11 @@ def velocity_warp_3d(x, y, z, t, velocity_field, rot_axis, jax=False):
         if ('x' in params): args['x'] = x
         if ('y' in params): args['y'] = y
         velocity = velocity_field(**args)
-        theta_rot = 2 * np.pi * t * velocity
-        rot_matrix = utils.rotation_matrix(rot_axis, theta_rot)
-        warped_coords = np.sum(rot_matrix * np.stack((x, y, z)), axis=1)
+        theta_rot = 2 * _np.pi * t * velocity
+        rot_matrix = utils.rotation_matrix(rot_axis, theta_rot, jax=jax)
+        warped_coords = _np.sum(rot_matrix * _np.stack((x, y, z)), axis=1)
 
-    warped_coords = np.moveaxis(warped_coords, 0, -1)
+    warped_coords = _np.moveaxis(warped_coords, 0, -1)
     return warped_coords
 
 def integrate_rays(medium, sensor, dim='geo'):

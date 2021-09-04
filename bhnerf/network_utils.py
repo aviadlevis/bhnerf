@@ -58,22 +58,12 @@ class PREDICT_EMISSION_2D(nn.Module):
         emission_MLP = MLP()
 
         def predict_emission(x, y, t, v):
-    
             net_input = emission_utils.velocity_warp_2d(x, y, t, v, jax=True)
             valid_inputs_mask = jnp.isfinite(net_input)
             net_input = jnp.where(valid_inputs_mask, net_input, jnp.zeros_like(net_input))
             net_output = emission_MLP(posenc(net_input, self.posenc_deg))
             emission = nn.sigmoid(net_output[..., 0])
             emission = jnp.where(valid_inputs_mask[..., 0], emission, jnp.zeros_like(emission))
-
-            # Ground truth emission
-#             radius_gt = 3.5
-#             theta_gt = np.pi / 2.
-#             center = [radius_gt * jnp.sin(theta_gt), radius_gt * jnp.cos(theta_gt)]
-#             std = 0.4
-#             emission = jnp.exp(-0.5*( (net_input[..., 1] - center[1])**2 + (net_input[..., 0] - center[0])**2 ) / std**2)
-#             emission = jnp.where(jnp.isfinite(emission), emission, jnp.zeros_like(emission))
-
             return emission
 
         emission = predict_emission(x, y, t, v)
@@ -104,6 +94,54 @@ class PREDICT_EMISSION_2D(nn.Module):
         loss, [emission, rendering] = vals
         return loss, state, emission, rendering, new_key
 
+class PREDICT_EMISSION_3D(nn.Module):
+    """Full function to predict emission at a time step."""
+    posenc_deg: int = 3
+    
+    @nn.compact
+    def __call__(self, x, y, z, t, v, axis):
+
+        emission_MLP = MLP()
+
+        def predict_emission(x, y, z, t, v, axis):
+            net_input = emission_utils.velocity_warp_3d(x, y, z, t, v, axis, jax=True)
+            valid_inputs_mask = jnp.isfinite(net_input)
+            net_input = jnp.where(valid_inputs_mask, net_input, jnp.zeros_like(net_input))
+            net_output = emission_MLP(posenc(net_input, self.posenc_deg))
+            emission = nn.sigmoid(net_output[..., 0])
+            emission = jnp.where(valid_inputs_mask[..., 0], emission, jnp.zeros_like(emission))
+            return emission
+
+        emission = predict_emission(x, y, z, t, v, axis)
+
+        return emission
+    
+    def lossfn(self, params, x, y, z, d, t, v, axis, target, key):
+        emission = self.apply({'params': params}, x, y, z, t, v, axis)
+        valid_d_mask = jnp.isfinite(d)
+        d = jnp.where(valid_d_mask, d, jnp.zeros_like(d))
+        rendering = jnp.sum(emission * d, axis=-1)
+        loss = jnp.mean((rendering - target)**2)
+        return loss, [emission, rendering]
+
+    @functools.partial(jit, static_argnums=(0, 1))
+    def train_step(self, v, axis, i, x, y, z, d, t, target, state, key):
+        key, new_key = random.split(key)
+        vals, grads = jax.value_and_grad(self.lossfn, argnums=(0), has_aux=True)(
+            state.params, x, y, z, d, t, v, axis, target, new_key)
+        grads = jax.lax.pmean(grads, axis_name='batch')
+        state = state.apply_gradients(grads=grads)
+        loss, [emission, rendering] = vals
+        return loss, state, emission, rendering, new_key
+
+    @functools.partial(jit, static_argnums=(0, 1))
+    def eval_step(self, v, axis, i, x, y, z, d, t, target, state, key):
+        key, new_key = random.split(key)
+        vals, grads = jax.value_and_grad(self.lossfn, argnums=(0), has_aux=True)(
+            state.params, x, y, z, d, t, v, axis, target, new_key)
+        loss, [emission, rendering] = vals
+        return loss, state, emission, rendering, new_key
+    
 def safe_sin(x):
     """jnp.sin() on a TPU will NaN out for moderately large values."""
     return jnp.sin(x % (100 * jnp.pi))
@@ -140,11 +178,9 @@ def get_input_coords(sensor, nt, ngeo=None, npix=None):
     
     if 't' in sensor:
         sensor = sensor.drop('t')
-        
-    interpolated_sensor = sensor.expand_dims(t=nt).interp(
-        geo=np.linspace(0, sensor.geo.size-1, ngeo),
-        pix=np.linspace(0, sensor.pix.size-1, npix)
-    )
+    interpolated_sensor = sensor.interp(geo=np.linspace(0, sensor.geo.size-1, ngeo),
+                                        pix=np.linspace(0, sensor.pix.size-1, npix))
+    interpolated_sensor = interpolated_sensor.expand_dims(t=range(nt))
     t = np.broadcast_to(np.linspace(0, 1, nt)[:, None, None], [nt, npix, ngeo])
     coordinates = {
         't': t.reshape(nt*npix, ngeo),
