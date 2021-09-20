@@ -3,6 +3,7 @@ import numpy as np
 import xarray as xr
 import skimage.transform
 from inspect import signature
+import jax.numpy as jnp
 
 def gaussian_2d(ny, nx, std, fwhm=None, fov=(1.0, 'unitless'), center=(0,0), std_clip=np.inf):
     """
@@ -51,7 +52,7 @@ def gaussian_2d(ny, nx, std, fwhm=None, fov=(1.0, 'unitless'), center=(0,0), std
         })
     return image
 
-def gaussian_3d(nx, ny, nz, std,  fwhm=None, fov=(1.0, 'uniless'), center=(0,0,0), std_clip=np.inf):
+def gaussian_3d(nx, ny, nz, std,  fov=(1.0, 'uniless'), center=(0,0,0), std_clip=np.inf):
     """
     Gaussian image.
 
@@ -59,10 +60,8 @@ def gaussian_3d(nx, ny, nz, std,  fwhm=None, fov=(1.0, 'uniless'), center=(0,0,0
     ----------
     nx, ny, nz: int,
             Number of (x/y/z)-axis grid points.
-    std: float,
-        Gaussian standard deviation. Used if fwhm is not specified.
-    fwhm: float, optional,
-        Gaussian full width half max. Overrides the std parameter.
+    std: (stdx, stdy, stdz), or float,
+        Gaussian standard deviation in x,y,z directions. If scalar specified isotropic std is used.
     fov: (float, str), default=(1.0, 'unitless')
         Field of view and units. Default is unitless 1.0.
     center: tuple, default=(0,0,0)
@@ -75,16 +74,14 @@ def gaussian_3d(nx, ny, nz, std,  fwhm=None, fov=(1.0, 'uniless'), center=(0,0,0
     image: xr.DataArray,
         An image DataArray with dimensions ['x', 'y', 'z'].
     """
-    if fwhm is None:
-        fwhm = 2 * np.sqrt(2 * np.log(2)) * std
-    else:
-        std = fwhm / (2 * np.sqrt(2 * np.log(2)))
-
+    if np.isscalar(std): std = (std, std, std)
+    if len(std) != 3: raise AttributeError('std should be either a scalar or or length 3')
+    
     start = (-fov[0] / 2.0, -fov[0] / 2.0, -fov[0] / 2.0)
     stop = (fov[0] / 2.0, fov[0] / 2.0, fov[0] / 2.0)
     grid = utils.linspace_3d((nx, ny, nz), start, stop, units=fov[1])
     
-    data = np.exp(-0.5*( (grid.x - center[0])**2 + (grid.y - center[1])**2 + (grid.z - center[2])**2 ) / std**2)
+    data = np.exp(-0.5*( ((grid.x - center[0])/std[0])**2 + ((grid.y - center[1])/std[1])**2 + ((grid.z - center[2])/std[2])**2 ))
     threshold = np.exp(-0.5 * std_clip ** 2)
     image = xr.DataArray(
         name='emission',
@@ -94,7 +91,6 @@ def gaussian_3d(nx, ny, nz, std,  fwhm=None, fov=(1.0, 'uniless'), center=(0,0,0
         attrs={
             'fov': fov,
             'std': std,
-            'fwhm': fwhm,
             'center': center,
             'std_clip': std_clip
         })
@@ -138,11 +134,6 @@ def generate_hotspots_3d(nx, ny, nz, theta, phi, orbit_radius, std, r_isco=3, fo
         initial_frame /= initial_frame.max()
         
     return initial_frame
-
-def world_to_image_coords(coords, fov, npix):
-    for i in range(coords.shape[-1]):
-        coords[...,i] = (coords[...,i] + fov[i]/2.0) / fov[i] * (npix[i] - 1)
-    return coords
     
 def generate_orbit_2d(initial_frame, nt, velocity_field):
     movie = []
@@ -152,7 +143,7 @@ def generate_orbit_2d(initial_frame, nt, velocity_field):
     y, x = np.meshgrid(initial_frame.y, initial_frame.x, indexing='ij')
     for t in np.linspace(0.0, 1.0, nt):
         warped_coords = velocity_warp_2d(x, y, t, velocity_field)
-        image_coords = np.moveaxis(world_to_image_coords(warped_coords, fov=(fovy, fovx), npix=npix), -1, 0)
+        image_coords = np.moveaxis(utils.world_to_image_coords(warped_coords, fov=(fovy, fovx), npix=npix), -1, 0)
         frame_data = skimage.transform.warp(initial_frame, image_coords, mode='constant', cval=0.0)
         frame = xr.DataArray(frame_data, dims=['y', 'x'], coords={'t': t, 'y': initial_frame.y, 'x':initial_frame.x})
         movie.append(frame.expand_dims('t'))
@@ -168,7 +159,7 @@ def generate_orbit_3d(initial_frame, nt, velocity_field, rot_axis):
     x, y, z = np.meshgrid(initial_frame.x, initial_frame.y, initial_frame.z, indexing='ij')
     for t in np.linspace(0.0, 1.0, nt):
         warped_coords = velocity_warp_3d(x, y, z, t, velocity_field, rot_axis)
-        image_coords = np.moveaxis(world_to_image_coords(warped_coords, fov=(fovx, fovy, fovz), npix=npix), -1, 0)
+        image_coords = np.moveaxis(utils.world_to_image_coords(warped_coords, fov=(fovx, fovy, fovz), npix=npix), -1, 0)
         frame_data = skimage.transform.warp(initial_frame, image_coords, mode='constant', cval=0.0)
         frame = xr.DataArray(frame_data, dims=['x', 'y', 'z'], 
                              coords={'t': t, 'x':initial_frame.x, 'y': initial_frame.y, 'z': initial_frame.z})
@@ -176,12 +167,13 @@ def generate_orbit_3d(initial_frame, nt, velocity_field, rot_axis):
     movie = xr.concat(movie, dim='t')
     return movie
 
-def velocity_warp_2d(x, y, t, velocity_field, jax=False):
+def rotate_3d(volume, axis, angle):
+    output = generate_orbit_3d(volume, 2, angle/(2*np.pi), axis).isel(t=1)
+    return output
 
-    if jax: 
-        import jax.numpy as _np
-    else: 
-        _np = np
+def velocity_warp_2d(x, y, t, velocity_field, use_jax=False):
+
+    _np = jnp if use_jax else np
     
     radius = _np.sqrt(x**2 + y**2) 
     theta = _np.arctan2(y, x)
@@ -202,6 +194,8 @@ def velocity_warp_2d(x, y, t, velocity_field, jax=False):
     elif isinstance(velocity_field, xr.DataArray):
         velocity = velocity_field.interp(x=xr.DataArray(x).fillna(0.0), y=xr.DataArray(y).fillna(0.0)).data
   
+    # Fill NaNs with zeros
+    velocity = _np.where(_np.isfinite(velocity), velocity, _np.zeros_like(velocity))
     theta_rot = theta - 2 * _np.pi * t * velocity
 
     x_rot = radius * _np.cos(theta_rot)
@@ -209,19 +203,17 @@ def velocity_warp_2d(x, y, t, velocity_field, jax=False):
     warped_coords = _np.stack([y_rot, x_rot], axis=-1)
     return warped_coords
 
-def velocity_warp_3d(x, y, z, t, velocity_field, rot_axis, jax=False):
+def velocity_warp_3d(x, y, z, t, velocity_field, rot_axis, tstart=0.0, tstop=1.0, use_jax=False):
 
-    if jax: 
-        import jax.numpy as _np
-    else: 
-        _np = np
+    _np = jnp if use_jax else np
     
     radius = _np.sqrt(x**2 + y**2 + z**2) 
-
+    t_unitless = (t - tstart) / (tstop - tstart)
+    
     if _np.isscalar(velocity_field):
         velocity = velocity_field
-        theta_rot = 2 * _np.pi * t * velocity
-        rot_matrix = utils.rotation_matrix(rot_axis, theta_rot, jax=jax)
+        theta_rot = 2 * _np.pi * t_unitless * velocity
+        rot_matrix = utils.rotation_matrix(rot_axis, theta_rot, use_jax=use_jax)
         warped_coords = _np.dot(rot_matrix, _np.stack((x, y, z), axis=2))
 
     elif callable(velocity_field):
@@ -233,10 +225,13 @@ def velocity_warp_3d(x, y, z, t, velocity_field, rot_axis, jax=False):
         if ('x' in params): args['x'] = x
         if ('y' in params): args['y'] = y
         velocity = velocity_field(**args)
-        theta_rot = 2 * _np.pi * t * velocity
-        rot_matrix = utils.rotation_matrix(rot_axis, theta_rot, jax=jax)
+        
+        # Fill NaNs with zeros
+        velocity = _np.where(_np.isfinite(velocity), velocity, _np.zeros_like(velocity))
+        theta_rot = 2 * _np.pi * t_unitless * velocity
+        rot_matrix = utils.rotation_matrix(rot_axis, theta_rot, use_jax=use_jax)
         warped_coords = _np.sum(rot_matrix * _np.stack((x, y, z)), axis=1)
-
+        
     warped_coords = _np.moveaxis(warped_coords, 0, -1)
     return warped_coords
 

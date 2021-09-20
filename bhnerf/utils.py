@@ -1,6 +1,8 @@
 import numpy as np
 import xarray as xr
 import functools
+import math
+import jax.numpy as jnp
 
 def linspace_2d(num, start=(-0.5, -0.5), stop=(0.5, 0.5), endpoint=(True, True), units='unitless'):
     """
@@ -75,7 +77,7 @@ def linspace_3d(num, start=(-0.5, -0.5, -0.5), stop=(0.5, 0.5, 0.5), endpoint=(T
     
     return grid.utils_polar.add_coords(image_dims=['x','y','z'])
 
-def rotation_matrix(axis, angle, jax=False):
+def rotation_matrix(axis, angle, use_jax=False):
     """
     Return the rotation matrix associated with counterclockwise rotation about
     the given axis
@@ -86,7 +88,7 @@ def rotation_matrix(axis, angle, jax=False):
         Axis of rotation
     angle: float or numpy array of floats,
         Angle of rotation in radians
-    jax: bool, default=False
+    use_jax: bool, default=False
         Compuatations using jax.
         
     Returns
@@ -99,13 +101,11 @@ def rotation_matrix(axis, angle, jax=False):
     [1] https://en.wikipedia.org/wiki/Euler%E2%80%93Rodrigues_formula
     [2] https://stackoverflow.com/questions/6802577/rotation-of-3d-vector
     """
-    if jax: 
-        import jax.numpy as _np
-    else: 
-        _np = np
+    _np = jnp if use_jax else np
     
     axis = _np.array(axis)
     axis = axis / _np.sqrt(_np.dot(axis, axis))
+    
     a = _np.cos(angle / 2.0)
     b, c, d = _np.stack([-ax * _np.sin(angle / 2.0) for ax in axis])
     aa, bb, cc, dd = a * a, b * b, c * c, d * d
@@ -114,6 +114,13 @@ def rotation_matrix(axis, angle, jax=False):
                       [2 * (bc - ad), aa + cc - bb - dd, 2 * (cd + ab)],
                       [2 * (bd + ac), 2 * (cd - ab), aa + dd - bb - cc]])
 
+def world_to_image_coords(coords, fov, npix, use_jax=False):
+    _np = jnp if use_jax else np
+    image_coords = []
+    for i in range(coords.shape[-1]):
+        image_coords.append((coords[...,i] + fov[i]/2.0) / fov[i] * (npix[i] - 1))
+    image_coords = _np.stack(image_coords, axis=-1)
+    return image_coords
 
 @xr.register_dataset_accessor("utils_polar")
 @xr.register_dataarray_accessor("utils_polar")
