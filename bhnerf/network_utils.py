@@ -13,11 +13,11 @@ class MLP(nn.Module):
     """A simple MLP."""
     
     net_depth: int = 4
-    net_width: int = 256
-    activation: Callable[..., Any] = nn.elu
+    net_width: int = 128
+    activation: Callable[..., Any] = nn.relu
     out_channel: int = 1
     do_skip: bool = True
-
+  
     @nn.compact
     def __call__(self, x):
         """Multi-layer perception for nerf.
@@ -104,8 +104,11 @@ class PREDICT_EMISSION_3D_GRID(nn.Module):
     
     @nn.compact
     def __call__(self, x, y, z, t, v, axis):
+        
+        grid_init = lambda rng, shape: jnp.ones(shape) * -10.
+#         grid_init = lambda rng, shape: jnp.zeros(shape)
 
-        grid = self.param('grid', lambda key, values: jnp.array(values, dtype=jnp.float32), -5. * jnp.zeros((self.grid_res, self.grid_res, self.grid_res))) 
+        grid = self.param('grid', grid_init, (self.grid_res, self.grid_res, self.grid_res)) 
 
         def predict_emission(x, y, z, t, v, axis):
             net_input = emission_utils.velocity_warp_3d(x, y, z, t, v, axis, use_jax=True)
@@ -114,8 +117,8 @@ class PREDICT_EMISSION_3D_GRID(nn.Module):
             net_input = jnp.moveaxis(net_input, -1, 0)
             net_input = (net_input + self.fov / 2.) / self.fov * (self.grid_res - 1.)
             net_output = jax.scipy.ndimage.map_coordinates(grid, net_input, order=1, cval=0.)
-#             emission = nn.sigmoid(net_output)
-            emission = net_output
+            emission = nn.sigmoid(net_output)
+#             emission = net_output
             emission = jnp.where(valid_inputs_mask[..., 0], emission, jnp.zeros_like(emission))
             return emission
 
@@ -159,11 +162,59 @@ class PREDICT_EMISSION_3D(nn.Module):
         emission_MLP = MLP()
 
         def predict_emission(x, y, z, t, v, axis):
-            net_input = emission_utils.velocity_warp_3d(x, y, z, t,  v, axis, use_jax=True)
+            net_input = emission_utils.velocity_warp_3d(x, y, z, t, v, axis, use_jax=True)
             valid_inputs_mask = jnp.isfinite(net_input)
             net_input = jnp.where(valid_inputs_mask, net_input, jnp.zeros_like(net_input))
             net_output = emission_MLP(posenc(net_input, self.posenc_deg))
-            emission = nn.sigmoid(net_output[..., 0])
+            emission = nn.sigmoid(net_output[..., 0] - 10.)
+            emission = jnp.where(valid_inputs_mask[..., 0], emission, jnp.zeros_like(emission))
+            return emission
+
+        emission = predict_emission(x, y, z, t, v, axis)
+
+        return emission
+    
+    def lossfn(self, params, x, y, z, d, t, v, axis, target, key):
+        emission = self.apply({'params': params}, x, y, z, t, v, axis)
+        valid_d_mask = jnp.isfinite(d)
+        d = jnp.where(valid_d_mask, d, jnp.zeros_like(d))
+        rendering = jnp.sum(emission * d, axis=-1)
+        loss = jnp.mean((rendering - target)**2)
+        return loss, [emission, rendering]
+
+    @functools.partial(jit, static_argnums=(0, 1))
+    def train_step(self, v, axis, i, x, y, z, d, t, target, state, key):
+        key, new_key = random.split(key)
+        vals, grads = jax.value_and_grad(self.lossfn, argnums=(0), has_aux=True)(
+            state.params, x, y, z, d, t, v, axis, target, new_key)
+        grads = jax.lax.pmean(grads, axis_name='batch')
+        state = state.apply_gradients(grads=grads)
+        loss, [emission, rendering] = vals
+        return loss, state, emission, rendering, new_key
+
+    @functools.partial(jit, static_argnums=(0, 1))
+    def eval_step(self, v, axis, i, x, y, z, d, t, target, state, key):
+        key, new_key = random.split(key)
+        vals, grads = jax.value_and_grad(self.lossfn, argnums=(0), has_aux=True)(
+            state.params, x, y, z, d, t, v, axis, target, new_key)
+        loss, [emission, rendering] = vals
+        return loss, state, emission, rendering, new_key
+    
+class PREDICT_EMISSION_3D_NO_VELOCITY(nn.Module):
+    """Full function to predict emission with MLP at a time step."""
+    posenc_deg: int = 3
+    
+    @nn.compact
+    def __call__(self, x, y, z, t, v, axis):
+
+        emission_MLP = MLP()
+
+        def predict_emission(x, y, z, t, v, axis):
+            net_input = jnp.stack([x, y, z, t], axis=-1)
+            valid_inputs_mask = jnp.isfinite(net_input)
+            net_input = jnp.where(valid_inputs_mask, net_input, jnp.zeros_like(net_input))
+            net_output = emission_MLP(posenc(net_input, self.posenc_deg))
+            emission = nn.sigmoid(net_output[..., 0] - 10.)
             emission = jnp.where(valid_inputs_mask[..., 0], emission, jnp.zeros_like(emission))
             return emission
 
@@ -258,10 +309,62 @@ class PREDICT_EMISSION_AND_ROTAXIS_3D(nn.Module):
         loss, [emission, rendering, axis] = vals
         return loss, state, emission, rendering, axis, new_key
       
+class PREDICT_EMISSION_AND_MLP_ROTAXIS_3D(nn.Module):
+    """Full function to predict emission at a time step."""
+    posenc_deg: int = 3
+
+    @nn.compact
+    def __call__(self, x, y, z, t, velocity, tstart, tstop):
+
+        emission_MLP = MLP()
+        axis_MLP = MLP(net_depth=3, net_width=32, out_channel=3, do_skip=False, activation=lambda x: x)
+        
+        def predict_emission(x, y, z, t, velocity, axis, tstart, tstop):
+            net_input = emission_utils.velocity_warp_3d(
+                x, y, z, t, velocity, axis, tstart, tstop, use_jax=True)
+            valid_inputs_mask = jnp.isfinite(net_input)
+            net_input = jnp.where(valid_inputs_mask, net_input, jnp.zeros_like(net_input))
+            net_output = emission_MLP(posenc(net_input, self.posenc_deg))
+            emission = nn.sigmoid(net_output[..., 0] - 10.)
+            emission = jnp.where(valid_inputs_mask[..., 0], emission, jnp.zeros_like(emission))
+            return emission
+        
+        axis_net_input = jnp.array([-0.59162719, -2.67309611, -0.56935515]) # Normal distribution sampled fixed input
+        axis = axis_MLP(axis_net_input)
+        emission = predict_emission(x, y, z, t, velocity, axis, tstart, tstop)
+
+        return emission, axis
+    
+    def lossfn(self, params, x, y, z, d, t, velocity, uv, fov, tstart, tstop, target, rendering_true, sigma, bg_image, key):
+        emission, axis = self.apply({'params': params}, x, y, z, t, velocity, tstart, tstop)
+        valid_d_mask = jnp.isfinite(d)
+        d = jnp.where(valid_d_mask, d, jnp.zeros_like(d))
+        rendering = jnp.sum(emission * d, axis=-1) + bg_image
+        loss = jnp.mean((rendering - rendering_true)**2)
+        return loss, [emission, rendering, axis]
+
+    @functools.partial(jit, static_argnums=(0, 1))
+    def train_step(self, velocity, i, x, y, z, d, t, uv, fov, tstart, tstop, target, rendering_true, sigma, bg_image, state, key):
+        key, new_key = random.split(key)
+        vals, grads = jax.value_and_grad(self.lossfn, argnums=(0), has_aux=True)(
+            state.params, x, y, z, d, t, velocity, uv, fov, tstart, tstop, target, rendering_true, sigma, bg_image, new_key)
+        grads = jax.lax.pmean(grads, axis_name='batch')
+        state = state.apply_gradients(grads=grads)
+        loss, [emission, rendering, axis] = vals
+        return loss, state, emission, rendering, axis, new_key
+
+    @functools.partial(jit, static_argnums=(0, 1))
+    def eval_step(self, velocity, i, x, y, z, d, t, uv, fov, tstart, tstop, target, rendering_true, sigma, bg_image, state, key):
+        key, new_key = random.split(key)
+        vals, grads = jax.value_and_grad(self.lossfn, argnums=(0), has_aux=True)(
+            state.params, x, y, z, d, t, velocity, uv, fov, tstart, tstop, target, rendering_true, sigma, bg_image, new_key)
+        loss, [emission, rendering, axis] = vals
+        return loss, state, emission, rendering, axis, new_key
+      
 class PREDICT_EMISSION_AND_ROTAXIS_3D_FROM_VIS(nn.Module):
     """Full function to predict emission at a time step."""
     posenc_deg: int = 3
-    sigmoid_bias: float = -1.0
+
     @nn.compact
     def __call__(self, x, y, z, t, velocity, tstart, tstop):
 
@@ -329,8 +432,210 @@ class PREDICT_EMISSION_AND_ROTAXIS_3D_FROM_VIS(nn.Module):
             state.params, x, y, z, d, t, velocity, uv, fov, tstart, tstop, target, new_key)
         loss, [emission, rendering, axis] = vals
         return loss, state, emission, rendering, axis, new_key
+
+class PREDICT_EMISSION_AND_MLP_ROTAXIS_3D_FROM_VIS(nn.Module):
+    """Full function to predict emission at a time step."""
+    posenc_deg: int = 3
+
+    @nn.compact
+    def __call__(self, x, y, z, t, velocity, tstart, tstop):
+
+        emission_MLP = MLP()
+        axis_MLP = MLP(net_depth=3, net_width=32, out_channel=3, do_skip=False, activation=lambda x: x)
+        
+        def predict_emission(x, y, z, t, velocity, axis, tstart, tstop):
+            net_input = emission_utils.velocity_warp_3d(
+                x, y, z, t, velocity, axis, tstart, tstop, use_jax=True)
+            valid_inputs_mask = jnp.isfinite(net_input)
+            net_input = jnp.where(valid_inputs_mask, net_input, jnp.zeros_like(net_input))
+            net_output = emission_MLP(posenc(net_input, self.posenc_deg))
+            emission = nn.sigmoid(net_output[..., 0])
+            emission = jnp.where(valid_inputs_mask[..., 0], emission, jnp.zeros_like(emission))
+            
+            # Ground truth emission
+            # radius_gt = 3.5
+            # theta_gt = np.pi / 3.
+            # phi_gt = 0.0
+            # center = radius_gt * jnp.array([jnp.cos(phi_gt)*jnp.sin(theta_gt), 
+            #                                 jnp.sin(phi_gt)*jnp.sin(theta_gt), 
+            #                                 jnp.cos(theta_gt)])
+            # std = 0.4
+            # emission = jnp.exp(-0.5*( (net_input[...,0] - center[0])**2 + (net_input[...,1] - center[1])**2 +
+            #                          (net_input[...,2] - center[2])**2) / std**2)
+            # normalization_factor = 0.03
+            # emission *= normalization_factor
+            # emission = jnp.where(valid_inputs_mask[..., 0], emission, jnp.zeros_like(emission))
+
+            return emission
+        
+        axis_net_input = jnp.array([-0.59162719, -2.67309611, -0.56935515]) # Normal distribution sampled fixed input
+        axis = axis_MLP(axis_net_input)
+        emission = predict_emission(x, y, z, t, velocity, axis, tstart, tstop)
+
+        return emission, axis
     
+    def lossfn(self, params, x, y, z, d, t, velocity, uv, fov, tstart, tstop, target, sigma, key):
+        emission, axis = self.apply({'params': params}, x, y, z, t, velocity, tstart, tstop)
+        valid_d_mask = jnp.isfinite(d)
+        d = jnp.where(valid_d_mask, d, jnp.zeros_like(d))
+        rendering = jnp.sum(emission * d, axis=-1)
+        valid_uv_mask = jnp.isfinite(uv)
+        uv = jnp.where(valid_uv_mask, uv, jnp.zeros_like(uv))
+        visibilities = observation_utils.observe_nonoise(
+            rendering, uv[...,0], uv[...,1], fov, use_jax=True)
+        visibilities = jnp.where(valid_uv_mask[...,0], visibilities, jnp.zeros_like(visibilities))
+        loss = jnp.mean((jnp.abs(visibilities - target)/sigma)**2) # + (jnp.sqrt(jnp.dot(axis, axis))-1)**2
+        return loss, [emission, rendering, axis]
+
+    @functools.partial(jit, static_argnums=(0, 1))
+    def train_step(self, velocity, i, x, y, z, d, t, uv, fov, tstart, tstop, target, sigma, state, key):
+        key, new_key = random.split(key)
+        vals, grads = jax.value_and_grad(self.lossfn, argnums=(0), has_aux=True)(
+            state.params, x, y, z, d, t, velocity, uv, fov, tstart, tstop, target, sigma, new_key)
+        grads = jax.lax.pmean(grads, axis_name='batch')
+        state = state.apply_gradients(grads=grads)
+        loss, [emission, rendering, axis] = vals
+        return loss, state, emission, rendering, axis, new_key
+
+    @functools.partial(jit, static_argnums=(0, 1))
+    def eval_step(self, velocity, i, x, y, z, d, t, uv, fov, tstart, tstop, target, sigma, state, key):
+        key, new_key = random.split(key)
+        vals, grads = jax.value_and_grad(self.lossfn, argnums=(0), has_aux=True)(
+            state.params, x, y, z, d, t, velocity, uv, fov, tstart, tstop, target, sigma, new_key)
+        loss, [emission, rendering, axis] = vals
+        return loss, state, emission, rendering, axis, new_key
+
+class PREDICT_EMISSION_AND_MLP_ROTAXIS_3D_FROM_VIS_W_BG(nn.Module):
+    """Full function to predict emission at a time step."""
+    posenc_deg: int = 3
+
+    @nn.compact
+    def __call__(self, x, y, z, t, velocity, tstart, tstop):
+
+        emission_MLP = MLP()
+        axis_MLP = MLP(net_depth=3, net_width=32, out_channel=3, do_skip=False, activation=lambda x: x)
+        
+        def predict_emission(x, y, z, t, velocity, axis, tstart, tstop):
+            net_input = emission_utils.velocity_warp_3d(
+                x, y, z, t, velocity, axis, tstart, tstop, use_jax=True)
+            valid_inputs_mask = jnp.isfinite(net_input)
+            net_input = jnp.where(valid_inputs_mask, net_input, jnp.zeros_like(net_input))
+            net_output = emission_MLP(posenc(net_input, self.posenc_deg))
+            emission = nn.sigmoid(net_output[..., 0] - 10.)
+            emission = jnp.where(valid_inputs_mask[..., 0], emission, jnp.zeros_like(emission))
+            return emission
+        
+        axis_net_input = jnp.array([-0.59162719, -2.67309611, -0.56935515]) # Normal distribution sampled fixed input
+        axis = axis_MLP(axis_net_input)
+        emission = predict_emission(x, y, z, t, velocity, axis, tstart, tstop)
+
+        return emission, axis
     
+    def lossfn(self, params, x, y, z, d, t, velocity, ft_mats, tstart, tstop, target, sigma, bg_image, key):
+        emission, axis = self.apply({'params': params}, x, y, z, t, velocity, tstart, tstop)
+        rendering = jnp.sum(emission * d, axis=-1) + bg_image
+        vis = jnp.stack([jnp.matmul(ft, image.ravel()) for ft, image in zip(ft_mats, rendering)])
+        valid_mask = jnp.isfinite(sigma)
+        vis = jnp.where(valid_mask, vis, jnp.zeros_like(vis))
+        loss = jnp.mean((jnp.abs(vis - target)/sigma)**2)
+        return loss, [emission, rendering, axis]
+
+    @functools.partial(jit, static_argnums=(0, 1))
+    def train_step(self, velocity, i, x, y, z, d, t, ft_mats, tstart, tstop, target, sigma, bg_image, state, key):
+        key, new_key = random.split(key)
+        vals, grads = jax.value_and_grad(self.lossfn, argnums=(0), has_aux=True)(
+            state.params, x, y, z, d, t, velocity, ft_mats, tstart, tstop, target, sigma, bg_image, new_key)
+        grads = jax.lax.pmean(grads, axis_name='batch')
+        state = state.apply_gradients(grads=grads)
+        loss, [emission, rendering, axis] = vals
+        return loss, state, emission, rendering, axis, new_key
+
+    @functools.partial(jit, static_argnums=(0, 1))
+    def eval_step(self, velocity, i, x, y, z, d, t, ft_mats, tstart, tstop, target, sigma, bg_image, state, key):
+        key, new_key = random.split(key)
+        vals, grads = jax.value_and_grad(self.lossfn, argnums=(0), has_aux=True)(
+            state.params, x, y, z, d, t, velocity, ft_mats, tstart, tstop, target, sigma, bg_image, new_key)
+        loss, [emission, rendering, axis] = vals
+        return loss, state, emission, rendering, axis, new_key
+    
+class PREDICT_EMISSION_AND_MLP_ROTAXIS_3D_FROM_VIS_W_BG_PRATUL(nn.Module):
+    """Full function to predict emission at a time step."""
+    posenc_deg: int = 3
+
+    @nn.compact
+    def __call__(self, x, y, z, t, velocity, tstart, tstop):
+
+        emission_MLP = MLP()
+        axis_MLP = MLP(net_depth=3, net_width=32, out_channel=3, do_skip=False, activation=lambda x: x)
+        
+        def predict_emission(x, y, z, t, velocity, axis, tstart, tstop):
+            net_input = emission_utils.velocity_warp_3d(
+                x, y, z, t, velocity, axis, tstart, tstop, use_jax=True)
+            valid_inputs_mask = jnp.isfinite(net_input)
+            net_input = jnp.where(valid_inputs_mask, net_input, jnp.zeros_like(net_input))
+            net_output = emission_MLP(posenc(net_input, self.posenc_deg))
+            emission = nn.sigmoid(net_output[..., 0] - 10.)
+            emission = jnp.where(valid_inputs_mask[..., 0], emission, jnp.zeros_like(emission))
+            
+#             Ground truth emission
+#             radius_gt = 3.5
+#             theta_gt = np.pi / 3.
+#             phi_gt = 0.0
+#             center = radius_gt * jnp.array([jnp.cos(phi_gt)*jnp.sin(theta_gt), 
+#                                             jnp.sin(phi_gt)*jnp.sin(theta_gt), 
+#                                             jnp.cos(theta_gt)])
+#             std = 0.4
+#             emission = jnp.exp(-0.5*( (net_input[...,0] - center[0])**2 + (net_input[...,1] - center[1])**2 +
+#                                      (net_input[...,2] - center[2])**2) / std**2)
+#             normalization_factor = 1.0
+#             emission *= normalization_factor
+#             emission = jnp.where(valid_inputs_mask[..., 0], emission, jnp.zeros_like(emission))
+            
+            return emission
+        
+        axis_net_input = jnp.array([-0.59162719, -2.67309611, -0.56935515]) # Normal distribution sampled fixed input
+        axis = axis_MLP(axis_net_input)
+        emission = predict_emission(x, y, z, t, velocity, axis, tstart, tstop)
+
+        return emission, axis
+    
+    def lossfn(self, params, x, y, z, d, t, velocity, uv, fov, tstart, tstop, target, rendering_true, sigma, bg_image, key):
+        emission, axis = self.apply({'params': params}, x, y, z, t, velocity, tstart, tstop)
+        valid_d_mask = jnp.isfinite(d)
+        d = jnp.where(valid_d_mask, d, jnp.zeros_like(d))
+        rendering = jnp.sum(emission * d, axis=-1) + bg_image
+        valid_uv_mask = jnp.isfinite(uv)
+        uv = jnp.where(valid_uv_mask, uv, jnp.zeros_like(uv))
+        visibilities = observation_utils.observe_nonoise(
+            rendering, uv[...,0], uv[...,1], fov, use_jax=True)
+        visibilities = jnp.where(valid_uv_mask[...,0], visibilities, jnp.zeros_like(visibilities))
+        
+        # Pratul testing with same observation function for us and ground truth
+        target = observation_utils.observe_nonoise(
+            rendering_true, uv[...,0], uv[...,1], fov, use_jax=True)
+        target = jnp.where(valid_uv_mask[...,0], target, jnp.zeros_like(target))
+        
+        loss = jnp.mean((jnp.abs(visibilities - target)/sigma)**2)
+        return loss, [emission, rendering, axis]
+
+    @functools.partial(jit, static_argnums=(0, 1))
+    def train_step(self, velocity, i, x, y, z, d, t, uv, fov, tstart, tstop, target, rendering_true, sigma, bg_image, state, key):
+        key, new_key = random.split(key)
+        vals, grads = jax.value_and_grad(self.lossfn, argnums=(0), has_aux=True)(
+            state.params, x, y, z, d, t, velocity, uv, fov, tstart, tstop, target, rendering_true, sigma, bg_image, new_key)
+        grads = jax.lax.pmean(grads, axis_name='batch')
+        state = state.apply_gradients(grads=grads)
+        loss, [emission, rendering, axis] = vals
+        return loss, state, emission, rendering, axis, new_key
+
+    @functools.partial(jit, static_argnums=(0, 1))
+    def eval_step(self, velocity, i, x, y, z, d, t, uv, fov, tstart, tstop, target, rendering_true, sigma, bg_image, state, key):
+        key, new_key = random.split(key)
+        vals, grads = jax.value_and_grad(self.lossfn, argnums=(0), has_aux=True)(
+            state.params, x, y, z, d, t, velocity, uv, fov, tstart, tstop, target, rendering_true, sigma, bg_image, new_key)
+        loss, [emission, rendering, axis] = vals
+        return loss, state, emission, rendering, axis, new_key
+     
 class PREDICT_EMISSION_AND_ROTAXIS_3D_FROM_FOURIER(nn.Module):
     """Full function to predict emission at a time step."""
     posenc_deg: int = 3
@@ -350,7 +655,6 @@ class PREDICT_EMISSION_AND_ROTAXIS_3D_FROM_FOURIER(nn.Module):
             net_output = emission_MLP(posenc(net_input, self.posenc_deg))
             emission = nn.sigmoid(net_output[..., 0])
             emission = jnp.where(valid_inputs_mask[..., 0], emission, jnp.zeros_like(emission))
-
             
             """
             # Ground truth emission

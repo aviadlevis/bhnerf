@@ -53,7 +53,7 @@ def gaussian_2d(ny, nx, std, fwhm=None, fov=(1.0, 'unitless'), center=(0,0), std
         })
     return image
 
-def gaussian_3d(nx, ny, nz, std,  fov=(1.0, 'uniless'), center=(0,0,0), std_clip=np.inf):
+def gaussian_3d(nx, ny, nz, std,  fov=(1.0, 'unitless'), center=(0,0,0), std_clip=np.inf):
     """
     Gaussian image.
 
@@ -161,12 +161,14 @@ def generate_orbit_3d(initial_frame, nt, velocity_field, rot_axis):
     for t in np.linspace(0.0, 1.0, nt):
         warped_coords = velocity_warp_3d(x, y, z, t, velocity_field, rot_axis)
         image_coords = np.moveaxis(utils.world_to_image_coords(warped_coords, fov=(fovx, fovy, fovz), npix=npix), -1, 0)
-        frame_data = skimage.transform.warp(initial_frame, image_coords, mode='constant', cval=0.0)
+        frame_data = skimage.transform.warp(initial_frame, image_coords, mode='constant', cval=0.0, order=3)
         frame = xr.DataArray(frame_data, dims=['x', 'y', 'z'], 
                              coords={'t': t, 'x':initial_frame.x, 'y': initial_frame.y, 'z': initial_frame.z})
         movie.append(frame.expand_dims('t'))
     movie = xr.concat(movie, dim='t')
     return movie
+
+
 
 def rotate_3d(volume, axis, angle):
     output = generate_orbit_3d(volume, 2, angle/(2*np.pi), axis).isel(t=1)
@@ -213,9 +215,6 @@ def velocity_warp_3d(x, y, z, t, velocity_field, rot_axis, tstart=0.0, tstop=1.0
     
     if _np.isscalar(velocity_field):
         velocity = velocity_field
-        theta_rot = 2 * _np.pi * t_unitless * velocity
-        rot_matrix = utils.rotation_matrix(rot_axis, theta_rot, use_jax=use_jax)
-        warped_coords = _np.dot(rot_matrix, _np.stack((x, y, z), axis=2))
 
     elif callable(velocity_field):
         args = {}
@@ -227,12 +226,16 @@ def velocity_warp_3d(x, y, z, t, velocity_field, rot_axis, tstart=0.0, tstop=1.0
         if ('y' in params): args['y'] = y
         velocity = velocity_field(**args)
         
-        # Fill NaNs with zeros
-        velocity = _np.where(_np.isfinite(velocity), velocity, _np.zeros_like(velocity))
-        theta_rot = 2 * _np.pi * t_unitless * velocity
-        rot_matrix = utils.rotation_matrix(rot_axis, theta_rot, use_jax=use_jax)
-        warped_coords = _np.sum(rot_matrix * _np.stack((x, y, z)), axis=1)
-        
+    # Fill NaNs with zeros
+    velocity = _np.where(_np.isfinite(velocity), velocity, _np.zeros_like(velocity))
+    theta_rot = 2 * _np.pi * t_unitless * velocity
+    rot_matrix = utils.rotation_matrix(rot_axis, theta_rot, use_jax=use_jax)
+    coords = _np.stack((x, y, z))
+    if (rot_matrix.ndim == 2):
+        warped_coords = np.einsum('ij,{}'.format('jklm'[:coords.ndim]), rot_matrix, coords)
+    else:
+        warped_coords = _np.sum(rot_matrix * coords, axis=1)
+
     warped_coords = _np.moveaxis(warped_coords, 0, -1)
     return warped_coords
 
