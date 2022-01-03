@@ -8,8 +8,8 @@ import jax.scipy.ndimage as jnd
 import scipy.ndimage as nd
 import utils 
 
-def plot_uv_coverage(obs, ax=None, fontsize=14, cmap='rainbow', add_conjugate=True, xlim=(-9.5, 9.5), ylim=(-9.5, 9.5),
-                     shift_inital_time=True, cbar=True):
+def plot_uv_coverage(obs, ax=None, fontsize=14, s=None, cmap='rainbow', add_conjugate=True, xlim=(-9.5, 9.5), ylim=(-9.5, 9.5),
+                     shift_inital_time=True, cbar=True, cmap_ticks=[0, 4, 8, 12], time_units='Hrs'):
     """
     Plot the uv coverage as a function of observation time.
     x axis: East-West frequency
@@ -23,6 +23,8 @@ def plot_uv_coverage(obs, ax=None, fontsize=14, cmap='rainbow', add_conjugate=Tr
         A matplotlib axis object for the visualization.
     fontsize: float, default=14,
         x/y-axis label fontsize.
+    s: float,
+        Marker size of the scatter points
     cmap : str, default='rainbow'
         A registered colormap name used to map scalar data to colors.
     add_conjugate: bool, default=True,
@@ -31,6 +33,10 @@ def plot_uv_coverage(obs, ax=None, fontsize=14, cmap='rainbow', add_conjugate=Tr
         x-axis range in [Giga lambda] units
     shift_inital_time: bool,
         If True, observation time starts at t=0.0
+    cmap_ticks: list,
+        List of the temporal ticks on the colorbar
+    time_units: str,
+        Units for the colorbar
     """
     from mpl_toolkits.axes_grid1 import make_axes_locatable
 
@@ -52,7 +58,10 @@ def plot_uv_coverage(obs, ax=None, fontsize=14, cmap='rainbow', add_conjugate=Tr
     else:
         fig = ax.get_figure()
 
-    sc = ax.scatter(u, v, c=t, cmap=plt.cm.get_cmap(cmap))
+    if time_units == 'mins':
+        t *= 60.0
+        
+    sc = ax.scatter(u, v, c=t, cmap=plt.cm.get_cmap(cmap), s=s)
     ax.set_xlabel(r'East-West Freq $[G \lambda]$', fontsize=fontsize)
     ax.set_ylabel(r'North-South Freq $[G \lambda]$', fontsize=fontsize)
     ax.invert_xaxis()
@@ -63,8 +72,8 @@ def plot_uv_coverage(obs, ax=None, fontsize=14, cmap='rainbow', add_conjugate=Tr
     if cbar is True:
         divider = make_axes_locatable(ax)
         cax = divider.append_axes('right', size='3.5%', pad=0.2)
-        cbar = fig.colorbar(sc, cax=cax, ticks=[0, 4, 8, 12])
-        cbar.set_ticklabels(['{} Hrs'.format(tick) for tick in cbar.get_ticks()])
+        cbar = fig.colorbar(sc, cax=cax, ticks=cmap_ticks)
+        cbar.set_ticklabels(['{} {}'.format(tick, time_units) for tick in cbar.get_ticks()])
     plt.tight_layout()
     
 def empty_eht_obs(array, nt, tint, tstart=4.0, tstop=15.5,
