@@ -3,21 +3,27 @@ import xarray as xr
 import functools
 import math
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
 
-def linspace_2d(num, start=(-0.5, -0.5), stop=(0.5, 0.5), endpoint=(True, True), units='unitless'):
+mse = lambda true, est: float(np.mean((true - est)**2))
+
+psnr = lambda true, est: float(10.0 * np.log10(np.max(true)**2 / mse(true, est)))
+
+normalize = lambda vector: vector / np.sqrt(np.dot(vector, vector))
+
+def linspace_xr(num, start=-0.5, stop=0.5, endpoint=True, units='unitless'):
     """
-    Return a 2D DataArray with coordinates spaced over a specified interval.
+    Return a DataArray with coordinates spaced over a specified interval in N-dimensions.
 
     Parameters
     ----------
     num: int or tuple
-        Number of grid points in (y, x) dimensions. If num is a scalar the 2D coordinates are assumed to
-        have the same number of points.
-    start: (float, float)
-        (y, x) starting grid point (included in the grid)
-    stop: (float, float)
-        (y, x) ending grid point (optionally included in the grid)
-    endpoint: (bool, bool)
+        Number of grid points in 1D (x) or 2D (x, y) or 3D (x, y, z). 
+    start: float
+        starting grid point (included in the grid)
+    stop: float
+        ending grid point (optionally included in the grid)
+    endpoint: bool
         Optionally include the stop points in the grid.
     units: str, default='unitless'
         Store the units of the underlying grid.
@@ -26,56 +32,66 @@ def linspace_2d(num, start=(-0.5, -0.5), stop=(0.5, 0.5), endpoint=(True, True),
     -------
     grid: xr.DataArray
         A DataArray with coordinates linearly spaced over the desired interval
+    """
+    dimensions = ['x', 'y', 'z']
+    num = np.atleast_1d(num)
+    coords = {}
+    for i, n in enumerate(num):
+        coord = np.linspace(start, stop, n, endpoint=endpoint)
+        coords[dimensions[i]] = coord
+    grid = xr.Dataset(coords=coords)
+    for dim in grid.dims:
+        grid[dim].attrs.update(units=units)
+    return grid
 
-    Notes
-    -----
-    Also computes image polar coordinates (r, theta).
+def gaussian_xr(resolution, center, std,  fov=(1.0, 'unitless'), std_clip=np.inf):
     """
-    num = (num, num) if np.isscalar(num) else num
-    y = np.linspace(start[0], stop[0], num[0], endpoint=endpoint[0])
-    x = np.linspace(start[1], stop[1], num[1], endpoint=endpoint[1])
-    grid = xr.Dataset(coords={'y': y, 'x': x})
-    grid.y.attrs.update(units=units)
-    grid.x.attrs.update(units=units)
-    return grid.utils_polar.add_coords()
-  
-def linspace_3d(num, start=(-0.5, -0.5, -0.5), stop=(0.5, 0.5, 0.5), endpoint=(True, True, True), units='unitless'):
-    """
-    Return a 2D DataArray with coordinates spaced over a specified interval.
+    Generate a Gaussian image as xarray.DataArray.
 
     Parameters
     ----------
-    num: int or tuple
-        Number of grid points in (x, y, z) dimensions. If num is a scalar the 3D coordinates are assumed to
-        have the same number of points.
-    start: (float, float, float)
-        (x, y, z) starting grid point (included in the grid)
-    stop: (float, float, float)
-        (x, y, z) ending grid point (optionally included in the grid)
-    endpoint: (bool, bool, bool)
-        Optionally include the stop points in the grid.
-    units: str, default='unitless'
-        Store the units of the underlying grid.
+    resolution: int or nd-array,
+            Number of (x,y,z)-axis grid points.
+    center: int or nd-array,
+        Center of the gaussian in coordinates ('x', 'y', 'z')
+    std: (stdx, stdy, stdz), or float,
+        Gaussian standard deviation in x,y,z directions. If scalar specified isotropic std is used.
+    fov: (float, str), default=(1.0, 'unitless')
+        Field of view and units. Default is unitless 1.0.
+    std_clip: float, default=np.inf
+        Clip after this number of standard deviations
 
     Returns
     -------
-    grid: xr.DataArray
-        A DataArray with coordinates linearly spaced over the desired interval
-
-    Notes
-    -----
-    Also computes image polar coordinates (r, theta).
+    emission: xr.DataArray,
+        A DataArray with Gaussian emission.
     """
-    num = (num, num, num) if np.isscalar(num) else num
-    x = np.linspace(start[0], stop[0], num[0], endpoint=endpoint[0])
-    y = np.linspace(start[1], stop[1], num[1], endpoint=endpoint[1])
-    z = np.linspace(start[2], stop[2], num[2], endpoint=endpoint[2])
-    grid = xr.Dataset(coords={'x': x, 'y': y, 'z': z})
-    grid.x.attrs.update(units=units)
-    grid.y.attrs.update(units=units)
-    grid.z.attrs.update(units=units)
-    
-    return grid.utils_polar.add_coords(image_dims=['x','y','z'])
+    if np.isscalar(std): std = (std, std, std)
+    if len(resolution) != len(center): raise AttributeError('resolution and center should have same length {} != {}'.format(
+        len(resolution), len(center)))
+    grid = linspace_xr(resolution, start=-fov[0]/2.0, stop=fov[0]/2.0, units=fov[1])
+    if 'x' in grid.dims and 'y' in grid.dims and 'z' in grid.dims:
+        data = np.exp(-0.5*( ((grid.x - center[0])/std[0])**2 + ((grid.y - center[1])/std[1])**2 + ((grid.z - center[2])/std[2])**2 ))
+        dims = ['x', 'y', 'z']
+    elif 'x' in grid.dims and 'y' in grid.dims:
+        data = np.exp(-0.5*( ((grid.y - center[1])/std[1])**2 + ((grid.x - center[0])/std[0])**2 ))
+        dims = ['y', 'x']
+    else:
+        raise AttributeError
+
+    threshold = np.exp(-0.5 * std_clip ** 2)
+    emission = xr.DataArray(
+        name='emission',
+        data=data.where(data > threshold).fillna(0.0),
+        coords=grid.coords,
+        dims=dims,
+        attrs={
+            'fov': fov,
+            'std': std,
+            'center': center,
+            'std_clip': std_clip
+        })
+    return emission
 
 def rotation_matrix(axis, angle, use_jax=False):
     """
@@ -114,6 +130,32 @@ def rotation_matrix(axis, angle, use_jax=False):
                       [2 * (bc - ad), aa + cc - bb - dd, 2 * (cd + ab)],
                       [2 * (bd + ac), 2 * (cd - ab), aa + dd - bb - cc]])
 
+def spherical_coords_to_rotation_axis(theta, phi):
+    """
+    Transform the spherical coordinates into a rotation axis and angle
+    
+    Parameters
+    ----------
+    theta: float,
+        zenith angle (rad)
+    phi: float,
+        azimuth angle (rad)
+        
+    Returns
+    -------
+    rot_axis: 3-vector,
+        Rotation axis.
+    rot_angle: float, 
+        Rotation angle about the rot_axis.
+    """
+    z_axis = np.array([0, 0, 1])
+    r_vector = np.array([np.cos(phi)*np.sin(theta), np.sin(phi)*np.sin(theta), np.cos(theta)])
+    rot_axis_prime = np.cross(r_vector, z_axis)
+    rot_matrix = rotation_matrix(rot_axis_prime,  np.pi/2)
+    rot_axis = np.matmul(rot_matrix, r_vector)
+    rot_angle = phi
+    return rot_axis, rot_angle
+
 def world_to_image_coords(coords, fov, npix, use_jax=False):
     _np = jnp if use_jax else np
     image_coords = []
@@ -122,39 +164,49 @@ def world_to_image_coords(coords, fov, npix, use_jax=False):
     image_coords = _np.stack(image_coords, axis=-1)
     return image_coords
 
-@xr.register_dataset_accessor("utils_polar")
-@xr.register_dataarray_accessor("utils_polar")
-class _PolarAccessor(object):
+def intensity_to_nchw(intensity, cmap='viridis', gamma=0.5):
     """
-    Register a custom accessor PolarAccessor on xarray.DataArray and xarray.Dataset objects.
-    This adds methods for polar coordinate processing on a 2D (x,y) grid.
+    Utility function to converent a grayscale image to NCHW image (for tensorboard logging).
+       N: number of images in the batch
+       C: number of channels of the image (ex: 3 for RGB, 1 for grayscale...)
+       H: height of the image
+       W: width of the image
+
+    Parameters
+    ----------
+    intensity: array,
+         Grayscale intensity image.
+    cmap : str, default='viridis'
+        A registered colormap name used to map scalar data to colors.
+    gamma: float, default=0.5
+        Gamma correction term
+        
+    Returns
+    -------
+    nchw_images: array, 
+        Array of images.
     """
-    def __init__(self, xarray_obj):
-        self._obj = xarray_obj
+    cm = plt.get_cmap(cmap)
+    norm_images = ( (intensity - np.min(intensity)) / (np.max(intensity) - np.min(intensity)) )**gamma
+    nchw_images = np.moveaxis(cm(norm_images)[...,:3], (0, 1, 2, 3), (3, 2, 0, 1))
+    return nchw_images
 
-    def add_coords(self, image_dims=['y', 'x']):
-        """
-        Add polar coordinates to image_dimensions
-
-        Parameters
-        ----------
-        image_dims: [dim1, dim2], default=['y', 'x'],
-            Image data dimensions.
-
-        Returns
-        -------
-        grid: xr.DataArray,
-            A data array with additional polar coordinates 'r'
-        """
-        if not(np.all([dim in self._obj.coords for dim in image_dims])):
-            raise AttributeError('Grid coordinates have to contain image dimensions')
-        coords = np.meshgrid(*self._obj.coords.values(), indexing='ij')
-        r = np.sqrt(functools.reduce(lambda x, y: x**2 + y**2, coords))
-        grid = self._obj.assign_coords(r=(image_dims, r))
-
-        # Add units to 'r'
-        units = [grid[dim].units for dim in image_dims]
-        if not(np.all([units[0] == x for x in units])):
-            raise AttributeError('different units for different axis not supported')
-        grid['r'].attrs.update(units=units[0])
-        return grid
+def anti_aliasing_filter(image_plane, window):
+    """
+    Anti-aliasing flitering / blurring
+    
+    Parameters
+    ----------
+    image_plane: np.array,
+        2D image or 3D movie (frames are in the first index)
+    window: np.array
+        2D image used for anti-aliasing filtering
+    
+    Returns
+    -------
+    image_plane: np.array,
+        2D image or 3D movie (frames are in the first index)
+    """
+    fourier = jnp.fft.fft2(jnp.fft.ifftshift(image_plane, axes=(-2, -1))) * jnp.fft.fft2(jnp.fft.ifftshift(window))
+    image_plane = jnp.fft.ifftshift(jnp.fft.ifft2(fourier, axes=(-2, -1))).real
+    return image_plane

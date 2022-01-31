@@ -4,7 +4,10 @@ import numpy as np
 from matplotlib import animation
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from ipywidgets import interact
-
+from bhnerf.utils import normalize
+import jax
+from jax import numpy as jnp
+import functools
 
 def animate_synced(movie, measurements, axes, t_dim='t', vmin=None, vmax=None, cmap='RdBu_r', add_ticks=True,
                    add_colorbar=True, title=None, fps=10, output=None):
@@ -57,7 +60,7 @@ def animate_synced(movie, measurements, axes, t_dim='t', vmin=None, vmax=None, c
         anim.save(output, writer='imagemagick', fps=fps)
     return anim
 
-@xr.register_dataarray_accessor("utils_visualization")
+@xr.register_dataarray_accessor("visualization")
 class _VisualizationAccessor(object):
     """
     Register a custom accessor VisualizationAccessor on xarray.DataArray object.
@@ -176,3 +179,249 @@ class _VisualizationAccessor(object):
         if output is not None:
             anim.save(output, writer='imagemagick', fps=fps)
         return anim
+
+class VolumeVisualizer(object):
+    def __init__(self, width, height, samples):
+        """
+        A Volume visualization class
+        
+        Parameters
+        ----------
+        width: int
+            camera horizontal resolution.
+        height: int
+            camera vertical resolution.
+        samples: int
+            Number of integration points along a ray.
+        """
+        self.width = width
+        self.height = height
+        self.samples = samples 
+        self.focal = .5 * width / jnp.tan(.5 * 0.7)
+        self._pts = None
+        
+    def set_view(self, radius, azimuth, zenith, up=np.array([0., 0., 1.])):
+        """
+        Set camera view geometry
+        
+        Parameters
+        ----------
+        radius: float,
+            Distance from the origin
+        azimuth: float, 
+            Azimuth angle in radians
+        zenith: float, 
+            Zenith angle in radians
+        up: array, default=[0,0,1]
+            The up direction determines roll of the camera
+        """
+        camorigin = radius * np.array([np.cos(azimuth)*np.sin(zenith), 
+                                       np.sin(azimuth)*np.sin(zenith), 
+                                       np.cos(zenith)])
+        self._viewmatrix = self.viewmatrix(camorigin, up, camorigin)
+        rays_o, rays_d = self.generate_rays(
+            self._viewmatrix, self.width, self.height, self.focal)
+        self._pts = self.sample_along_rays(rays_o, rays_d, 15., 35., self.samples)
+        self.x, self.y, self.z = self._pts[...,0], self._pts[...,1], self._pts[...,2]
+        self.d = jnp.linalg.norm(jnp.concatenate([jnp.diff(self._pts, axis=2), 
+                                                  jnp.zeros_like(self._pts[...,-1:,:])], 
+                                                 axis=2), axis=-1)
+    
+    def render(self, emission, jit=False, bh_radius=0.0, norm_const=1.0, facewidth=10., linewidth=0.1, bh_albedo=[0,0,0], cmap='hot'):
+        """
+        Render an image of the 3D emission
+        
+        Parameters
+        ----------
+        emission: 3D array 
+            3D array with emission values
+        jit: bool, default=False,
+            Just in time compilation. Set true for rendering multiple frames.
+            First rendering will take more time due to compilation.
+        bh_radius: float, default=0.0
+            Radius at which to draw a black hole (for visualization). 
+            If bh_radius=0 then no black hole is drawn.
+        norm_const: float, default=1.0 
+            normalize (divide) by this constant) 
+        facewidth: float, default=10.0 
+            width of the enclosing cube face
+        linewidth: float, default=0.1
+            width of the cube lines
+        bh_albedo: list, default=[0,0,0]
+            Albedo (rgb) of the black hole. default is completly black.
+        cmap: str, default='hot'
+            Colormap for visualization
+        Returns
+        -------
+        rendering: array,
+            Rendered image
+        """
+        if self._pts is None: 
+            raise AttributeError('must set view before rendering')
+        emission = emission / norm_const
+        
+        cm = plt.get_cmap('hot') 
+        emission_cm = cm(emission)
+        emission_cm = jnp.clip(emission_cm - 0.05, 0.0, 1.0)
+        emission_cm = jnp.concatenate([emission_cm[..., :3], emission[..., None] / jnp.amax(emission)], axis=-1)
+
+        if jit:
+            emission_cube = draw_cube_jit(emission_cm, self._pts, facewidth, linewidth)
+            if bh_radius > 0:
+                emission_cube = draw_bh_jit(emission_cube, self._pts, bh_radius, bh_albedo)
+        else:
+            emission_cube = draw_cube(emission_cm, self._pts, facewidth, linewidth)
+            if bh_radius > 0:
+                emission_cube = draw_bh(emission_cube, self._pts, bh_radius, bh_albedo)
+        rendering = alpha_composite(emission_cube, self.d, self._pts, bh_radius)
+        return rendering
+    
+    def viewmatrix(self, lookdir, up, position):
+        """Construct lookat view matrix."""
+        vec2 = normalize(lookdir)
+        vec0 = normalize(np.cross(up, vec2))
+        vec1 = normalize(np.cross(vec2, vec0))
+        m = np.stack([vec0, vec1, vec2, position], axis=1)
+        return m
+
+    def generate_rays(self, camtoworlds, width, height, focal):
+        """Generating rays for all images."""
+        x, y = np.meshgrid(  # pylint: disable=unbalanced-tuple-unpacking
+            np.arange(width, dtype=np.float32),  # X-Axis (columns)
+            np.arange(height, dtype=np.float32),  # Y-Axis (rows)
+            indexing='xy')
+        camera_dirs = np.stack(
+            [(x - width * 0.5 + 0.5) / focal,
+             -(y - height * 0.5 + 0.5) / focal, -np.ones_like(x)],
+            axis=-1)
+        directions = ((camera_dirs[..., None, :] *
+                       camtoworlds[None, None, :3, :3]).sum(axis=-1))
+        origins = np.broadcast_to(camtoworlds[None, None, :3, -1],
+                                  directions.shape)
+
+        return origins, directions
+
+    def sample_along_rays(self, rays_o, rays_d, near, far, num_samples):
+        t_vals = jnp.linspace(near, far, num_samples)
+        pts = rays_o[..., None, :] + t_vals[None, None, :, None] * rays_d[..., None, :]
+        return pts
+
+def alpha_composite(emission, dists, pts, bh_rad, inside_halfwidth=4.5):
+    emission = np.clip(emission, 0., 1.)
+    color = emission[..., :-1] * dists[0, ..., None]
+    alpha = emission[..., -1:] 
+    
+    # mask for points inside wireframe
+    inside = np.where(np.less(np.amax(np.abs(pts), axis=-1), inside_halfwidth), 
+                      np.ones_like(pts[..., 0]),
+                      np.zeros_like(pts[..., 0]))
+    
+    # masks for points outside black hole
+    bh = np.where(np.greater(np.linalg.norm(pts, axis=-1), bh_rad),
+                  np.ones_like(pts[..., 0]),
+                  np.zeros_like(pts[..., 0]))
+    
+    combined_mask = np.logical_and(inside, bh)
+    
+    
+    rendering = np.zeros_like(color[:, :, 0, :])
+    acc = np.zeros_like(color[:, :, 0, 0])
+    outside_acc = np.zeros_like(color[:, :, 0, 0])
+    for i in range(alpha.shape[-2]):
+        ind = alpha.shape[-2] - i - 1
+        
+        # if pixels inside cube and outside black hole, don't alpha composite
+        rendering = rendering + combined_mask[..., ind, None] * color[..., ind, :]
+        
+        # else, alpha composite      
+        outside_alpha = alpha[..., ind, :] * (1. - combined_mask[..., ind, None])
+        rendering = rendering * (1. - outside_alpha) + color[..., ind, :] * outside_alpha 
+        
+        acc = alpha[..., ind, 0] + (1. - alpha[..., ind, 0]) * acc
+        outside_acc = outside_alpha[..., 0] + (1. - outside_alpha[..., 0]) * outside_acc
+        
+    rendering += np.array([1., 1., 1.])[None, None, :] * (1. - acc[..., None])
+    return rendering
+
+@jax.jit
+def draw_cube_jit(emission_cm, pts, facewidth, linewidth):
+    
+    linecolor = jnp.array([0.0, 0.0, 0.0, 1000.0])
+    vertices = jnp.array([[-facewidth/2., -facewidth/2., -facewidth/2.],
+                        [facewidth/2., -facewidth/2., -facewidth/2.],
+                        [-facewidth/2., facewidth/2., -facewidth/2.],
+                        [facewidth/2., facewidth/2., -facewidth/2.],
+                        [-facewidth/2., -facewidth/2., facewidth/2.],
+                        [facewidth/2., -facewidth/2., facewidth/2.],
+                        [-facewidth/2., facewidth/2., facewidth/2.],
+                        [facewidth/2., facewidth/2., facewidth/2.]])
+    dirs = jnp.array([[-1., 0., 0.],
+                      [1., 0., 0.],
+                      [0., -1., 0.],
+                      [0., 1., 0.],
+                      [0., 0., -1.],
+                      [0., 0., 1.]])
+
+    for i in range(vertices.shape[0]):
+
+        for j in range(dirs.shape[0]):
+            # Draw line segments from each vertex
+            line_seg_pts = vertices[i, None, :] + jnp.linspace(0.0, facewidth, 64)[:, None] * dirs[j, None, :]
+
+            for k in range(line_seg_pts.shape[0]):
+                dists = jnp.linalg.norm(pts - jnp.broadcast_to(line_seg_pts[k, None, None, None, :], pts.shape), axis=-1)
+                emission_cm += linecolor[None, None, None, :] * jnp.exp(-1. * dists / linewidth ** 2)[..., None]
+
+    out = jnp.where(jnp.greater(jnp.broadcast_to(jnp.amax(jnp.abs(pts), axis=-1, keepdims=True), emission_cm.shape), 
+                                facewidth/2. + linewidth), jnp.zeros_like(emission_cm), emission_cm)
+    return out
+
+def draw_cube(emission_cm, pts, facewidth, linewidth):
+    linecolor = jnp.array([0.0, 0.0, 0.0, 1000.0])
+    vertices = jnp.array([[-facewidth/2., -facewidth/2., -facewidth/2.],
+                        [facewidth/2., -facewidth/2., -facewidth/2.],
+                        [-facewidth/2., facewidth/2., -facewidth/2.],
+                        [facewidth/2., facewidth/2., -facewidth/2.],
+                        [-facewidth/2., -facewidth/2., facewidth/2.],
+                        [facewidth/2., -facewidth/2., facewidth/2.],
+                        [-facewidth/2., facewidth/2., facewidth/2.],
+                        [facewidth/2., facewidth/2., facewidth/2.]])
+    dirs = jnp.array([[-1., 0., 0.],
+                      [1., 0., 0.],
+                      [0., -1., 0.],
+                      [0., 1., 0.],
+                      [0., 0., -1.],
+                      [0., 0., 1.]])
+
+    for i in range(vertices.shape[0]):
+
+        for j in range(dirs.shape[0]):
+            # Draw line segments from each vertex
+            line_seg_pts = vertices[i, None, :] + jnp.linspace(0.0, facewidth, 64)[:, None] * dirs[j, None, :]
+
+            for k in range(line_seg_pts.shape[0]):
+                dists = jnp.linalg.norm(pts - jnp.broadcast_to(line_seg_pts[k, None, None, None, :], pts.shape), axis=-1)
+                emission_cm += linecolor[None, None, None, :] * jnp.exp(-1. * dists / linewidth ** 2)[..., None]
+
+    out = jnp.where(jnp.greater(jnp.broadcast_to(jnp.amax(jnp.abs(pts), axis=-1, keepdims=True), emission_cm.shape), 
+                                facewidth/2. + linewidth), jnp.zeros_like(emission_cm), emission_cm)
+    return out
+
+@jax.jit
+def draw_bh_jit(emission, pts, bh_radius, bh_albedo):
+    bh_albedo = jnp.array(bh_albedo)[None, None, None, :]
+    lightdir = jnp.array([-1., -1., 1.])
+    lightdir /= jnp.linalg.norm(lightdir, axis=-1, keepdims=True)
+    bh_color = jnp.sum(lightdir * pts, axis=-1)[..., None] * bh_albedo
+    emission = jnp.where(jnp.less(jnp.linalg.norm(pts, axis=-1, keepdims=True), bh_radius),
+                    jnp.concatenate([bh_color, jnp.ones_like(emission[..., 3:])], axis=-1), emission)
+    return emission
+
+def draw_bh(emission, pts, bh_radius, bh_albedo):
+    bh_albedo = jnp.array(bh_albedo)[None, None, None, :]
+    lightdir = jnp.array([-1., -1., 1.])
+    lightdir /= jnp.linalg.norm(lightdir, axis=-1, keepdims=True)
+    bh_color = jnp.sum(lightdir * pts, axis=-1)[..., None] * bh_albedo
+    emission = jnp.where(jnp.less(jnp.linalg.norm(pts, axis=-1, keepdims=True), bh_radius),
+                    jnp.concatenate([bh_color, jnp.ones_like(emission[..., 3:])], axis=-1), emission)
+    return emission
