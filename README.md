@@ -1,4 +1,4 @@
-# bhNeRF
+# bhnerf
 Gravitationally Lensed Black Hole Emission Tomography using [Neural Radiance Fields (NeRF)](https://www.matthewtancik.com/nerf).
 
 Curved rays trajectories are computed using [kgeo](https://github.com/achael/kgeo). This is an implementation of raytracing null geodesics in the Kerr metric using the formalism of [Gralla and Lupsasca 2019](https://arxiv.org/abs/1910.12881). 
