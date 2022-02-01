@@ -14,3 +14,5 @@ flax>=0.3.4
 ipympl>=0.7.0
 tensorflow-gpu
 ipyvolume
+mpmath
+
