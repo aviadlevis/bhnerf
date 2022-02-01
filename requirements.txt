@@ -1,0 +1,16 @@
+numpy>=1.20.3
+scipy>=1.7.1
+matplotlib>=3.4.3
+jupyter>=1.0.0
+jupyterlab>=3.1.10
+nodejs>=15.14.0
+python-flatbuffers>=2.0
+scikit-image>=0.18.3
+scikit-learn>=0.24.2
+tensorboard>=2.2.1
+tensorboardx>=2.4
+tqdm>=4.62.2
+flax>=0.3.4
+ipympl>=0.7.0
+tensorflow-gpu
+ipyvolume
