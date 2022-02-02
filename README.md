@@ -8,10 +8,10 @@ Curved rays trajectories are computed using [kgeo](https://github.com/achael/kge
 Installation
 ---
 
-Clone bhNeRF repository with the kgeo submodule
+Clone bhnerf repository with the [kgeo](https://github.com/achael/kgeo) submodule
 ```
-git clone --recurse-submodules https://github.com/aviadlevis/bhNeRF.git
-cd bhNeRF
+git clone --recurse-submodules https://github.com/aviadlevis/bhnerf.git
+cd bhnerf
 ```
 
 Start a conda virtual environment and add channels
@@ -52,7 +52,10 @@ Install `bhnerf`
 ```
 pip install .
 ```
-
+Note currently [`kgeo`](https://github.com/achael/kgeo) requires and experimental [`scipy`](https://scipy.github.io/devdocs/release.1.8.0.html) version which has [elliptic integrals](https://scipy.github.io/devdocs/reference/special.html#module-scipy.special) implemented
+```
+pip install scipy==1.8.0rc4
+```
 
 Getting Started
 ----
