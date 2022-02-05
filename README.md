@@ -52,7 +52,7 @@ Install `bhnerf`
 ```
 pip install .
 ```
-Note currently [`kgeo`](https://github.com/achael/kgeo) requires and experimental [`scipy`](https://scipy.github.io/devdocs/release.1.8.0.html) version which has [elliptic integrals](https://scipy.github.io/devdocs/reference/special.html#module-scipy.special) implemented
+Note currently [`kgeo`](https://github.com/achael/kgeo) requires an experimental [`scipy`](https://scipy.github.io/devdocs/release.1.8.0.html) version which has [elliptic integrals](https://scipy.github.io/devdocs/reference/special.html#module-scipy.special) implemented
 ```
 pip install scipy==1.8.0rc4
 ```
