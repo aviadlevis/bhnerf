@@ -82,8 +82,8 @@ def posenc(x, deg):
                      list(x.shape[:-1]) + [-1])
     four_feat = safe_sin(jnp.concatenate([xb, xb + 0.5 * jnp.pi], axis=-1))
     return jnp.concatenate([x] + [four_feat], axis=-1)
-
-class NeRF3D_RotationAxis(nn.Module):
+    
+class NeRF_RotationAxis(nn.Module):
     """
     Full function to predict emission at a time step.
     
@@ -104,13 +104,20 @@ class NeRF3D_RotationAxis(nn.Module):
     do_skip: bool = True
     
     @nn.compact
-    def __call__(self, x, y, z, t, velocity, tstart, tstop, axis_init):
-
+    def __call__(self, coordinates, velocity, tstart, tstop, axis_init):
+        """
+        Parameters
+        ----------
+        coordinates: list of arrays, 
+            1. For 3D emission coords=[t, x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
+               alpha, beta are image coordinates. These arrays contain the ray integration points
+            2. For 2D emission coords=[t, x, y] with each array shape=(nt, num_alpha, ngeo)
+        """
         emission_MLP = MLP(self.net_depth, self.net_width, self.activation, self.out_channel, self.do_skip)
-
-        def predict_emission(x, y, z, t, velocity, axis, tstart, tstop):
+        
+        def predict_emission(coordinates, velocity, axis, tstart, tstop):
             net_input = bhnerf.emission.velocity_warp(
-                (x, y, z), t, velocity, axis, tstart, tstop, use_jax=True)
+                coordinates[1:], coordinates[0], velocity, axis, tstart, tstop, use_jax=True)
             valid_inputs_mask = jnp.isfinite(net_input)
             net_input = jnp.where(valid_inputs_mask, net_input, jnp.zeros_like(net_input))
             net_output = emission_MLP(posenc(net_input, self.posenc_deg))
@@ -119,7 +126,7 @@ class NeRF3D_RotationAxis(nn.Module):
             return emission
         
         axis = self.param('axis', lambda key, values: jnp.array(values, dtype=jnp.float32), axis_init)
-        emission = predict_emission(x, y, z, t, velocity, axis, tstart, tstop)
+        emission = predict_emission(coordinates, velocity, axis, tstart, tstop)
 
         return emission
 
@@ -128,9 +135,10 @@ class EmissionOperator(object):
         self.predictor = predictor
         self.kwargs = kwargs
 
-    def __call__(self, params, x, y, z, t):
-        output = self.predictor.apply({'params': params}, x, y, z, t, **self.kwargs)
+    def __call__(self, params, coordinates):
+        output = self.predictor.apply({'params': params}, coordinates, **self.kwargs)
         return output
+    
     
 class ImagePlaneOperator(object):
     def __init__(self, emission_op):
@@ -144,7 +152,7 @@ class ImagePlaneOperator(object):
         """
         self.emission_op = emission_op
 
-    def __call__(self, params, x, y, z, t, d):
+    def __call__(self, params, coordinates, path_lengths):
         """
         Generate image-plane pixels for a given network (emission operator).
         
@@ -152,16 +160,19 @@ class ImagePlaneOperator(object):
         ----------
         params, FrozenDict, 
             A dictionary with the neural network parameters.
-        x, y, z, t: arrays, shape=(nt, num_alpha, num_beta, ngeo)
-            Here alpha, beta are image coordinates. These arrays contain the ray integration points for every pixel in the image/
-            
+        coordinates: list of arrays, 
+            1. For 3D emission coords=[t, x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
+               alpha, beta are image coordinates. These arrays contain the ray integration points
+            2. For 2D emission coords=[t, x, y] with each array shape=(nt, num_alpha, ngeo)
+        path_lengths: array,
+            Path lengths for integration, shape=(nt, num_alpha, num_beta, ngeo)
         Returns
         -------
-        images: array, shape=(nt, num_alpha, num_beta), 
-            Image plane measurements.
+        images: array, 
+            Image plane pixels.
         """
-        emission = self.emission_op(params, x, y, z, t)
-        images = jnp.sum(emission * d, axis=-1)
+        emission = self.emission_op(params, coordinates)
+        images = jnp.sum(emission * path_lengths, axis=-1)
         return images   
     
 class VisibilityOperator(ImagePlaneOperator):
@@ -177,7 +188,7 @@ class VisibilityOperator(ImagePlaneOperator):
         """
         super().__init__(emission_op)
 
-    def __call__(self, params, x, y, z, t, d, dtft_matrices):
+    def __call__(self, params, coordinates, path_lengths, dtft_matrices):
         """
         Generate visibility measurements for a given network state and frequency sampling pattern.
         
@@ -185,8 +196,11 @@ class VisibilityOperator(ImagePlaneOperator):
         ----------
         params, FrozenDict, 
             A dictionary with the neural network parameters.
-        x, y, z, t: arrays, shape=(nt, num_alpha, num_beta, ngeo)
-            Here alpha, beta are image coordinates. These arrays contain the ray integration points for every pixel in the image/
+        coordinates: list of arrays, 
+            For 3D emission coords=[t, x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
+            alpha, beta are image coordinates. These arrays contain the ray integration points
+        path_lengths: array,
+            Path lengths for integration, shape=(nt, num_alpha, num_beta, ngeo)
         dtft_matrices: array, shape=(nt, nfreq, npix)
             Here nfreq is the (maximum) number of frequencies sampled at a given observation time and npix=num_alpha*num_beta.
             This array contains all the dtft matrices. 
@@ -198,7 +212,7 @@ class VisibilityOperator(ImagePlaneOperator):
         images: array, shape=(nt, num_alpha, num_beta)
             Image plane measurements.
         """
-        images = super().__call__(params, x, y, z, t, d)
+        images = super().__call__(params, coordinates, path_lengths)
         visibilities = jnp.stack([jnp.matmul(ft, image.ravel()) for ft, image in zip(dtft_matrices, images)])
         return visibilities, images     
 

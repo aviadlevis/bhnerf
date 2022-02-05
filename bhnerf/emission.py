@@ -127,7 +127,6 @@ def velocity_warp(grid, t, velocity_field, rot_axis, tstart=0.0, tstop=1.0, use_
         An array with the new coordinates for the warp transformation.
     """
     _np = jnp if use_jax else np
-    
     radius = _np.sqrt(_np.sum(_np.array([dim**2 for dim in grid]), axis=0))
     t_unitless = (t - tstart) / (tstop - tstart)
     
@@ -147,8 +146,8 @@ def velocity_warp(grid, t, velocity_field, rot_axis, tstart=0.0, tstop=1.0, use_
     theta_rot = 2 * _np.pi * t_unitless * velocity
     
     if len(grid) == 2:
-        inv_rot_matrix = np.array([[np.cos(theta_rot), -np.sin(theta_rot)], 
-                                   [np.sin(theta_rot), np.cos(theta_rot)]])
+        inv_rot_matrix = _np.array([[_np.cos(theta_rot), -_np.sin(theta_rot)], 
+                                    [_np.sin(theta_rot), _np.cos(theta_rot)]])
     elif len(grid) == 3:
         inv_rot_matrix = utils.rotation_matrix(rot_axis, -theta_rot, use_jax=use_jax)
     else:
@@ -156,7 +155,7 @@ def velocity_warp(grid, t, velocity_field, rot_axis, tstart=0.0, tstop=1.0, use_
         
     coords = _np.stack(grid)
     if (inv_rot_matrix.ndim == 2):
-        warped_coords = np.einsum('ij,{}'.format('jklm'[:coords.ndim]), inv_rot_matrix, coords)
+        warped_coords = _np.einsum('ij,{}'.format('jklm'[:coords.ndim]), inv_rot_matrix, coords)
     else:
         warped_coords = _np.sum(inv_rot_matrix * coords, axis=1)
     warped_coords = _np.moveaxis(warped_coords, 0, -1)
@@ -190,7 +189,7 @@ def integrate_rays(emission, sensor, dim='geo'):
     pixels = (inteporlated_values.fillna(0.0) * sensor.deltas).sum(dim)
     return pixels
 
-def zero_unsupervised_emission(emission, x, y, z, rmin=0, rmax=np.Inf):
+def zero_unsupervised_emission(emission, coords, rmin=0, rmax=np.Inf):
     """
     Zero emission that is not within the supervision region
     
@@ -198,8 +197,8 @@ def zero_unsupervised_emission(emission, x, y, z, rmin=0, rmax=np.Inf):
     ----------
     emission: np.array
         3D array with emission values
-    x, y, z: np.arrays
-        3D array shaped like emission with x,y,z coordinates
+    coords: list of np.arrays
+        Spatial coordinate arrays each shaped like emission
     rmin: float, default=0
         Zero values at radii < rmin
     rmax: float, default=np.inf
@@ -210,6 +209,8 @@ def zero_unsupervised_emission(emission, x, y, z, rmin=0, rmax=np.Inf):
     emission: np.array
         3D array with zeroed down emission values
     """
-    emission = jnp.where(x**2 + y**2 + z**2 < rmin**2, jnp.zeros_like(emission), emission)
-    emission = jnp.where(x**2 + y**2 + z**2 > rmax**2, jnp.zeros_like(emission), emission)
+    emission = np.squeeze(emission)
+    r = np.sum([np.squeeze(x)**2 for x in coords], axis=0)
+    emission = jnp.where(r < rmin**2, jnp.zeros_like(emission), emission)
+    emission = jnp.where(r > rmax**2, jnp.zeros_like(emission), emission)
     return emission
