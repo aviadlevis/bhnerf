@@ -208,5 +208,5 @@ def anti_aliasing_filter(image_plane, window):
         2D image or 3D movie (frames are in the first index)
     """
     fourier = jnp.fft.fft2(jnp.fft.ifftshift(image_plane, axes=(-2, -1))) * jnp.fft.fft2(jnp.fft.ifftshift(window))
-    image_plane = jnp.fft.ifftshift(jnp.fft.ifft2(fourier, axes=(-2, -1))).real
+    image_plane = jnp.fft.ifftshift(jnp.fft.ifft2(fourier), axes=(-2, -1)).real
     return image_plane
