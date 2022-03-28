@@ -127,7 +127,7 @@ def velocity_warp(grid, t, velocity_field, rot_axis, tstart=0.0, tstop=1.0, use_
         An array with the new coordinates for the warp transformation.
     """
     _np = jnp if use_jax else np
-    radius = _np.sqrt(_np.sum(_np.array([dim**2 for dim in grid]), axis=0))
+    radius = _np.sqrt(_np.sum(_np.array([dim**2 for dim in grid]), axis=0) + _np.finfo(_np.float32).eps)
     t_unitless = (t - tstart) / (tstop - tstart)
     
     if _np.isscalar(velocity_field):
