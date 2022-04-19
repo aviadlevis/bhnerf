@@ -46,6 +46,7 @@ def generate_hotspot_xr(resolution, rot_axis, rot_angle, orbit_radius, std, r_is
         rot_axis = rot_axis / np.sqrt(np.sum(rot_axis**2))
         z_axis = np.array([0, 0, 1])
         rot_axis_prime = np.cross(z_axis, rot_axis)
+        if np.sqrt(np.sum(rot_axis_prime**2)) < 1e-5: rot_axis_prime = z_axis 
         rot_angle_prime = np.arccos(np.dot(rot_axis, z_axis))
         rot_matrix = utils.rotation_matrix(rot_axis_prime, rot_angle_prime)
         center = np.matmul(rot_matrix, np.append(center_2d, 0.0))
