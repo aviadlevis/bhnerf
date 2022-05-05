@@ -60,6 +60,87 @@ def animate_synced(movie, measurements, axes, t_dim='t', vmin=None, vmax=None, c
         anim.save(output, writer='imagemagick', fps=fps)
     return anim
 
+def animate_movies_synced(movie_list, axes, t_dim='t', vmin=None, vmax=None, cmaps='afmhot', add_ticks=False,
+                   add_colorbars=True, titles=None, fps=10, output=None, flipy=False):
+    """
+    Synchronous animation of multiple 3D xr.DataArray along a chosen dimension.
+
+    Parameters
+    ----------
+    movie_list: list of xr.DataArrays
+        A list of movies to animated synchroniously.
+    axes: list of matplotlib axis,
+        List of matplotlib axis object for the visualization. Should have same length as movie_list.
+    t_dim: str, default='t'
+        The dimension along which to animate frames
+    vmin, vmax : float, optional
+        vmin and vmax define the data range that the colormap covers.
+        By default, the colormap covers the complete value range of the supplied data.
+    cmaps : list of str or matplotlib.colors.Colormap, optional
+        If this is a scalar then it is extended for all movies.
+        The Colormap instance or registered colormap name used to map scalar data to colors.
+        Defaults to :rc:`image.cmap`.
+    add_ticks: bool, default=True
+        If true then ticks will be visualized.
+    add_colorbars: list of bool, default=True
+        If this is a scalar then it is extended for all movies. If true then a colorbar will be visualized.
+    titles: list of strings, optional
+        List of titles for each animation. Should have same length as movie_list.
+    fps: float, default=10,
+        Frames per seconds.
+    output: string,
+        Path to save the animated gif. Should end with .gif.
+    flipy: bool, default=False,
+        Flip y-axis to match ehtim plotting function
+
+    Returns
+    -------
+    anim: matplotlib.animation.FuncAnimation
+        Animation object.
+    """
+    # Image animation function (called sequentially)
+    def animate_frame(i):
+        for movie, im in zip(movie_list, images):
+            im.set_array(movie.isel({t_dim: i}))
+        return images
+
+    fig = plt.gcf()
+    num_frames, nx, ny = movie_list[0].sizes.values()
+
+    image_dims = list(movie_list[0].sizes.keys())
+    image_dims.remove('t')
+    extent = [movie_list[0][image_dims[0]].min(), movie_list[0][image_dims[0]].max(),
+              movie_list[0][image_dims[1]].min(), movie_list[0][image_dims[1]].max()]
+
+    # initialization function: plot the background of each frame
+    images = []
+    titles = [movie.name for movie in movie_list] if titles is None else titles
+    cmaps = [cmaps]*len(movie_list) if isinstance(cmaps, str) else cmaps
+    vmin_list = [movie.min() for movie in movie_list] if vmin is None else vmin
+    vmax_list = [movie.max() for movie in movie_list] if vmax is None else vmax
+
+    for movie, ax, title, cmap, vmin, vmax in zip(movie_list, axes, titles, cmaps, vmin_list, vmax_list):
+        if add_ticks == False:
+            ax.set_xticks([])
+            ax.set_yticks([])
+        ax.set_title(title)
+        im = ax.imshow(np.zeros((nx, ny)), extent=extent, origin='lower', cmap=cmap)
+        if add_colorbars:
+            divider = make_axes_locatable(ax)
+            cax = divider.append_axes('right', size='5%', pad=0.05)
+            fig.colorbar(im, cax=cax)
+        im.set_clim(vmin, vmax)
+        images.append(im)
+        if flipy:
+            ax.invert_yaxis()
+
+    plt.tight_layout()
+    anim = animation.FuncAnimation(fig, animate_frame, frames=num_frames, interval=1e3 / fps)
+
+    if output is not None:
+        anim.save(output, writer='imagemagick', fps=fps)
+    return anim
+
 @xr.register_dataarray_accessor("visualization")
 class _VisualizationAccessor(object):
     """

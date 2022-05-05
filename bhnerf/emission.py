@@ -1,4 +1,5 @@
 from bhnerf import utils
+from bhnerf import constants as consts
 import numpy as np
 import scipy as sp
 import xarray as xr
@@ -56,7 +57,7 @@ def generate_hotspot_xr(resolution, rot_axis, rot_angle, orbit_radius, std, r_is
     
     return emission
 
-def generate_orbit(initial_frame, nt, velocity_field, rot_axis, tstart=0.0, tstop=1.0):
+def generate_orbit(initial_frame, nt, angular_velocity, rot_axis, tstart, tstop):
     """
     Generate an orbit using a velocity field and initial frame (2D/3D)
     
@@ -66,14 +67,12 @@ def generate_orbit(initial_frame, nt, velocity_field, rot_axis, tstart=0.0, tsto
         A DataArray with initial emission.
     nt: int, 
         Number of frames.
-    velocity_field: float or function, 
+    angular_velocity: float or function, 
         Either a homogeneous velocity field (float) or a function of "r"/"radius".
     rot_axis: 3d vector, 
         Rotation axis.
     tstart: float, default=0.0
         Start time of frame zero.
-    tstop: float, default=1.0
-        Stop time of frame nt.
     
     Returns
     -------
@@ -92,7 +91,7 @@ def generate_orbit(initial_frame, nt, velocity_field, rot_axis, tstart=0.0, tsto
     npix = [initial_frame[dim].size for dim in dims]
     grid = np.meshgrid(*[initial_frame[dim] for dim in dims], indexing='ij')
     for t in np.linspace(tstart, tstop, nt):
-        warped_coords = velocity_warp(grid, t, velocity_field, rot_axis, tstart, tstop)
+        warped_coords = velocity_warp(grid, t, angular_velocity, rot_axis, tstart)
         image_coords = np.moveaxis(utils.world_to_image_coords(warped_coords, fov=fov, npix=npix), -1, 0)
         frame_data = skimage.transform.warp(initial_frame, image_coords, mode='constant', cval=0.0, order=3)
         coords = dict([('t', t)] + [(dim, initial_frame[dim]) for dim in dims])
@@ -101,7 +100,7 @@ def generate_orbit(initial_frame, nt, velocity_field, rot_axis, tstart=0.0, tsto
     movie = xr.concat(movie, dim='t')
     return movie
 
-def velocity_warp(grid, t, velocity_field, rot_axis, tstart=0.0, tstop=1.0, use_jax=False):
+def velocity_warp(grid, t, angular_velocity, rot_axis, tstart=0.0, use_jax=False):
     """
     Generate an coordinate transoform for the velocity warp.
     
@@ -111,14 +110,12 @@ def velocity_warp(grid, t, velocity_field, rot_axis, tstart=0.0, tstop=1.0, use_
         A list of arrays with grid coordinates
     t: float, 
         time.
-    velocity_field: float or function, 
+    angular_velocity: float or function, 
         Either a homogeneous velocity field (float) or a function of "r"/"radius".
     rot_axis: 3d vector, 
         Rotation axis.
     tstart: float, default=0.0
         Start time of frame zero.
-    tstop: float, default=1.0
-        Stop time of frame nt.
     use_jax: bool, default=False,
         Using jax enables GPU accelerated computing.
         
@@ -129,22 +126,23 @@ def velocity_warp(grid, t, velocity_field, rot_axis, tstart=0.0, tstop=1.0, use_
     """
     _np = jnp if use_jax else np
     radius = _np.sqrt(_np.sum(_np.array([dim**2 for dim in grid]), axis=0) + _np.finfo(_np.float32).eps)
-    t_unitless = (t - tstart) / (tstop - tstart)
+    t_relative = (t - tstart)
+    # assert t_relative >= 0, 'time t ({}) is before start time ({})'.format(t, tstart)
     
-    if _np.isscalar(velocity_field):
-        velocity = velocity_field
+    if _np.isscalar(angular_velocity):
+        velocity = angular_velocity
 
-    elif callable(velocity_field):
+    elif callable(angular_velocity):
         args = {}
-        params = signature(velocity_field).parameters.keys()
+        params = signature(angular_velocity).parameters.keys()
         if ('radius' in params): args['radius'] = radius
         if ('theta' in params): args['theta'] = theta
         if ('r' in params): args['r'] = radius
-        velocity = velocity_field(**args)
+        velocity = angular_velocity(**args)
         
     # Fill NaNs with zeros
     velocity = _np.where(_np.isfinite(velocity), velocity, _np.zeros_like(velocity))
-    theta_rot = 2 * _np.pi * t_unitless * velocity
+    theta_rot = t_relative * velocity
     
     if len(grid) == 2:
         inv_rot_matrix = _np.array([[_np.cos(theta_rot), -_np.sin(theta_rot)], 
@@ -163,7 +161,7 @@ def velocity_warp(grid, t, velocity_field, rot_axis, tstart=0.0, tstop=1.0, use_
     
     return warped_coords
 
-def integrate_rays(emission, sensor, dim='geo'):
+def integrate_rays(emission, sensor, doppler_factor=1.0, dim='geo'):
     """
     Integrate emission over rays to get sensor pixel values.
     
@@ -173,10 +171,12 @@ def integrate_rays(emission, sensor, dim='geo'):
         A DataArray with emission values.
     sensor: xr.Dataset
         A Dataset with ray geomeries for integration. 
+    doppler_factor: np.array, default=1.0
+        Multiply emission by a doppler factor (relativistic beaming) 
     dim: str, default='geo'
         Name of the dimension along which integration is carried out. 
         The default corresponds to the dimension name used when generating a sensor.
-
+        
     Returns
     -------
     pixels: xr.DataArray,
@@ -186,7 +186,7 @@ def integrate_rays(emission, sensor, dim='geo'):
     coords = {'x': sensor.x, 'y': sensor.y}
     if 'z' in emission.dims:
         coords['z'] = sensor.z
-    inteporlated_values = emission.interp(coords)
+    inteporlated_values = emission.interp(coords) * doppler_factor
     pixels = (inteporlated_values.fillna(0.0) * sensor.deltas).sum(dim)
     return pixels
 
@@ -215,3 +215,109 @@ def zero_unsupervised_emission(emission, coords, rmin=0, rmax=np.Inf):
     emission = jnp.where(r < rmin**2, jnp.zeros_like(emission), emission)
     emission = jnp.where(r > rmax**2, jnp.zeros_like(emission), emission)
     return emission
+
+def doppler_factor(sensor, rot_axis, angular_velocity):
+    """
+    Compute the Doppler factor due to relativistic beaming
+    
+    Parameters
+    ----------
+    sensor: xr.Dataset
+        A Dataset with ray geomeries for integration. 
+    rot_axis: 3d vector, 
+        Rotation axis of the azimuthal velocity field.
+    angular_velocity: float or function, 
+        Either a homogeneous velocity field (float) or a function of "r"/"radius".
+        
+    Returns
+    -------
+    doppler_factor: np.array
+        Array with doppler multiplicative factor.
+    """
+    
+    sensor = sensor.fillna(-1e9)
+    coords = {'x': sensor.x, 'y': sensor.y}
+    if 'z' in sensor.variables:
+        coords['z'] = sensor.z
+    radius = sensor.r
+
+    if np.isscalar(angular_velocity):
+        linear_velocity = radius * angular_velocity
+
+    elif callable(angular_velocity):
+        args = {}
+        params = signature(angular_velocity).parameters.keys()
+        if ('radius' in params): args['radius'] = radius
+        if ('theta' in params): args['theta'] = theta
+        if ('r' in params): args['r'] = radius
+        linear_velocity = radius * angular_velocity(**args)
+
+    linear_velocity = linear_velocity.fillna(0.0)
+    linear_velocity *= (consts.G*consts.sgra.mass/consts.c**2) / 3600.0 # unit conversion to [m/s]
+    beta = linear_velocity / consts.c
+
+    # Emission velocity direction vector
+    r_vector = np.stack([sensor.x, sensor.y, np.zeros_like(sensor.z)])
+    r_vector = r_vector / (np.linalg.norm(r_vector, axis=0) + 1e-8)
+    e_vx, e_vy, e_vz = np.cross(rot_axis, r_vector, axis=0)
+    doppler_cosine = -sensor.vx*e_vx - sensor.vy*e_vy - sensor.vz*e_vz
+
+    doppler_factor = np.sqrt(1 - beta**2) / (1 - doppler_cosine * beta)
+    
+    return doppler_factor
+
+def load_sensor(spin, inclination, ngeo=100, num_alpha=64, num_beta=64, distance=1000.0, max_r=6.0):
+    """
+    Compute sensor rays for a given spin and inclination
+    
+    Parameters
+    ----------
+    spin: float
+        normalized spin value in range [0,1]
+    inclination: float, 
+        inclination angle in [rad] in range [0, pi/2]
+    ngeo: int, default=100
+        Number of points along a ray
+    num_alpha: int, default=64,
+        Number of pixels in the vertical direction
+    num_beta: int, default=64,
+        Number of pixels in the horizontal direction   
+    distance: float, default=1000.0
+        Distance to observer
+    max_r: float, default=6.0, 
+        maximum radius for integration (in units of GM/c^2)
+    
+    Returns
+    -------
+    sensor: xr.Dataset
+        A dataset specifying ray pahts for the sensor.
+        
+    Notes
+    -----
+    units are in GM/c^2
+    """
+    from kgeo import raytrace_ana
+    
+    alpha, beta = np.meshgrid(np.linspace(-8.0, 8.0, num_alpha), np.linspace(-8.0, 8.0, num_beta))
+    image_coords = [alpha.ravel(), beta.ravel()]
+    observer_coords = [0, distance, inclination, 0]
+    sensor = raytrace_ana(spin, observer_coords, image_coords, ngeo+1, plotdata=False).get_dataset()
+    sensor = sensor.isel(geo=range(ngeo))
+    sensor.attrs.update(num_alpha=num_alpha, num_beta=num_beta)
+
+    # Path direction vector
+    vx, vy, vz = vx/piecwise_dist, vy/piecwise_dist, vz/piecwise_dist
+    vx = xr.concat((xr.zeros_like(sensor.x.isel(geo=0)), vx), dim='geo').fillna(0.0)
+    vy = xr.concat((xr.zeros_like(sensor.y.isel(geo=0)), vy), dim='geo').fillna(0.0)
+    vz = xr.concat((xr.zeros_like(sensor.z.isel(geo=0)), vz), dim='geo').fillna(0.0)
+    sensor = sensor.assign(vx=vx, vy=vy, vz=vz)
+
+    piecwise_dist = xr.concat((xr.zeros_like(sensor.x.isel(geo=0)), piecwise_dist), dim='geo').fillna(0.0)
+    sensor = sensor.assign(deltas=piecwise_dist)
+    
+    for key, data_var in sensor.data_vars.items():
+        if data_var.dims == sensor.r.dims:
+            sensor[key] = data_var.where(sensor.r < max_r)
+    sensor = sensor.fillna(0.0)
+    
+    return sensor

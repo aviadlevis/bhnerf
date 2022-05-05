@@ -104,7 +104,7 @@ class NeRF_RotationAxis(nn.Module):
     do_skip: bool = True
     
     @nn.compact
-    def __call__(self, coordinates, velocity, tstart, tstop, axis_init):
+    def __call__(self, coordinates, velocity, tstart, axis_init):
         """
         Parameters
         ----------
@@ -115,9 +115,9 @@ class NeRF_RotationAxis(nn.Module):
         """
         emission_MLP = MLP(self.net_depth, self.net_width, self.activation, self.out_channel, self.do_skip)
         
-        def predict_emission(coordinates, velocity, axis, tstart, tstop):
+        def predict_emission(coordinates, velocity, axis, tstart):
             net_input = bhnerf.emission.velocity_warp(
-                coordinates[1:], coordinates[0], velocity, axis, tstart, tstop, use_jax=True)
+                coordinates[1:], coordinates[0], velocity, axis, tstart, use_jax=True)
             valid_inputs_mask = jnp.isfinite(net_input)
             net_input = jnp.where(valid_inputs_mask, net_input, jnp.zeros_like(net_input))
             net_output = emission_MLP(posenc(net_input, self.posenc_deg))
@@ -126,7 +126,7 @@ class NeRF_RotationAxis(nn.Module):
             return emission
         
         axis = self.param('axis', lambda key, values: jnp.array(values, dtype=jnp.float32), axis_init)
-        emission = predict_emission(coordinates, velocity, axis, tstart, tstop)
+        emission = predict_emission(coordinates, velocity, axis, tstart)
 
         return emission
 
