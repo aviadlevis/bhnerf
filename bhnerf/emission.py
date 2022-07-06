@@ -1,11 +1,10 @@
 from bhnerf import utils
 from bhnerf import constants as consts
 import numpy as np
-import scipy as sp
 import xarray as xr
 import skimage.transform
-from inspect import signature
 import jax.numpy as jnp
+from astropy import units
 
 def generate_hotspot_xr(resolution, rot_axis, rot_angle, orbit_radius, std, r_isco, fov=(10.0, 'GM/c^2'), std_clip=np.inf, normalize=True):
     """
@@ -54,145 +53,286 @@ def generate_hotspot_xr(resolution, rot_axis, rot_angle, orbit_radius, std, r_is
         
     emission = utils.gaussian_xr(resolution, center, std, fov=fov, std_clip=std_clip)
     if normalize: emission /= emission.max()
-    
+    emission.attrs.update(rot_axis=rot_axis)
     return emission
 
-def generate_orbit(initial_frame, nt, angular_velocity, rot_axis, tstart, tstop):
+def kerr_geodesics(spin, inclination, alpha_range, beta_range, ngeo=100, 
+                   num_alpha=64, num_beta=64, distance=1000.0, E=1.0, M=1.0, verbose=False):
     """
-    Generate an orbit using a velocity field and initial frame (2D/3D)
+    Compute Kerr geodesics for a given spin and inclination
     
     Parameters
     ----------
-    initial_frame: xr.DataArray
-        A DataArray with initial emission.
-    nt: int, 
-        Number of frames.
-    angular_velocity: float or function, 
-        Either a homogeneous velocity field (float) or a function of "r"/"radius".
-    rot_axis: 3d vector, 
-        Rotation axis.
-    tstart: float, default=0.0
-        Start time of frame zero.
+    spin: float
+        normalized spin value in range [0,1]
+    inclination: float, 
+        inclination angle in [rad] in range [0, pi/2]
+    alpha_range: tuple,
+        Vertical extent (M)
+    beta_range: tuple,
+        Horizontal extent (M)
+    ngeo: int, default=100
+        Number of points along a ray
+    num_alpha: int, default=64,
+        Number of pixels in the vertical direction
+    num_beta: int, default=64,
+        Number of pixels in the horizontal direction   
+    distance: float, default=1000.0
+        Distance to observer
+    E: float, default=1.0, 
+        Photon energy at infinity 
+    M: float, default=1.0, 
+        Black hole mass, taken as 1 (G=c=M=1)
+        
+    Returns
+    -------
+    geos: xr.Dataset
+        A dataset specifying geodesics (ray trajectories) ending at the image plane.
+        
+    Notes
+    -----
+    Overleaf notes: https://www.overleaf.com/project/60ff0ece5aa4f90d07f2a417
+    units are in GM/c^2
+    """
+    from kgeo import raytrace_ana
+    
+    alpha, beta = np.meshgrid(np.linspace(*alpha_range, num_alpha), np.linspace(*beta_range, num_beta), indexing='ij')
+    image_coords = [alpha.ravel(), beta.ravel()]
+    
+    observer_coords = [0, distance, inclination, 0]
+    geos = raytrace_ana(spin, observer_coords, image_coords, ngeo, plotdata=False, verbose=verbose)
+    geos = geos.get_dataset(num_alpha, num_beta)
+
+    pm = 1.0
+    Delta = geos.r**2 + geos.spin**2 - 2*M*geos.r
+    Sigma = geos.r**2 + geos.spin**2*np.cos(geos.theta)**2
+    A = (geos.r**2 + geos.spin**2)**2 - geos.spin**2*Delta*np.sin(geos.theta)**2
+
+    lam = -geos.alpha * np.sin(geos.inc)
+    eta = (geos.alpha**2 - geos.spin**2) * np.cos(geos.inc)**2 + geos.beta**2
+    R = (geos.r**2 + geos.spin**2 - geos.spin*lam)**2 - Delta * (eta + (lam - geos.spin)**2)
+
+    # Clip small values
+    R = R.where(np.abs(R) > 1e-10).fillna(0.0)
+    Theta = eta + geos.spin**2*np.cos(geos.theta)**2 - lam**2 / np.tan(geos.theta)**2
+
+    # Photon 4-vector momentum 
+    k_t  = -E
+    k_r  = pm * E * np.sqrt(R) / Delta
+    k_th = pm * E * np.sqrt(Theta)
+    k_ph = E * lam
+    
+    dtau = xr.concat((xr.zeros_like(geos.mino.isel(geo=0)), geos.mino.diff('geo')), dim='geo')
+    
+    geos = geos.assign(k_t=k_t, k_r=k_r, k_th=k_th, k_ph=k_ph, dtau=dtau, Sigma=Sigma, Delta=Delta, A=A, M=M, E=E)
+    return geos
+
+def compute_keplerian_velocity(geos, Omega):
+    """
+    Compute Keplerian velocity 4-vector on points sampled along Kerr geodesics
+    
+    Parameters
+    ----------
+    geos: xr.Dataset
+        Dataset with Kerr geodesics (see: `kerr_geodesics` for more details)
+    Omega: array, 
+        An array with angular velocity specified along the geodesics coordinates
     
     Returns
     -------
-    movie: xr.DataArray,
-        A movie of a temporally propogated emission field.
+    geos: xr.Dataset
+        updated geos Dataset with:
+        1. Orbit velocity components: (ut, ur, uth, uph)
+        2. Doppler boosting component: g
+        
+    Notes
+    -----
+    Overleaf notes: https://www.overleaf.com/project/60ff0ece5aa4f90d07f2a417
     """
-    movie = []
-    if initial_frame.ndim == 2:
-        dims = ['y', 'x']
-    elif initial_frame.ndim == 3: 
-        dims = ['x', 'y', 'z']
-    else:
-        raise AttributeError('number of dimensions of initial_frame ({}) not supported'.format(initial_frame.ndim))
+    # omega = 2*geos.spin*geos.M*geos.r / geos.A
+    # V = geos.A / (geos.Sigma * np.sqrt(geos.Delta)) * (Omega - omega)
+    # ut = np.sqrt(geos.A / (geos.Delta * geos.Sigma)) / np.sqrt(1-V**2)
+    
+    # Spacetime metric (Boyer-Linquist coordinates)
+    g_tt = -(1 - 2*geos.M*geos.r / geos.Sigma)
+    g_phph = geos.A*np.sin(geos.theta)**2 / geos.Sigma
+    g_tphi = 2*geos.M*geos.spin*geos.r*np.sin(geos.theta)**2 / geos.Sigma
+    
+    # 4-velocity vector
+    ut = 1 / np.sqrt(-(g_tt + 2*Omega*g_tphi + g_phph*Omega**2))
+    ur = 0.0
+    uth = 0.0
+    uph = ut * Omega
 
-    fov = [(initial_frame[dim].max() - initial_frame[dim].min()).data for dim in dims]
-    npix = [initial_frame[dim].size for dim in dims]
-    grid = np.meshgrid(*[initial_frame[dim] for dim in dims], indexing='ij')
-    for t in np.linspace(tstart, tstop, nt):
-        warped_coords = velocity_warp(grid, t, angular_velocity, rot_axis, tstart)
-        image_coords = np.moveaxis(utils.world_to_image_coords(warped_coords, fov=fov, npix=npix), -1, 0)
-        frame_data = skimage.transform.warp(initial_frame, image_coords, mode='constant', cval=0.0, order=3)
-        coords = dict([('t', t)] + [(dim, initial_frame[dim]) for dim in dims])
-        frame = xr.DataArray(frame_data, dims=dims, coords=coords)
-        movie.append(frame.expand_dims('t'))
-    movie = xr.concat(movie, dim='t')
-    return movie
+    # Compute Doppler factor as dot product of photon/emission momentum 4-vectors
+    g = geos.E / -(geos.k_t*ut + geos.k_r*ur + geos.k_th*uth + geos.k_ph*uph)
+    g = g.fillna(0.0)
+    
+    geos = geos.assign(g_tt=g_tt, g_phph=g_phph, g_tphi=g_tphi, ut=ut, ur=ur, uth=uth, uph=uph, g=g, Omega=Omega)
+    return geos
 
-def velocity_warp(grid, t, angular_velocity, rot_axis, tstart=0.0, use_jax=False):
+def velocity_warp_coords(coords, Omega, t_frames, t_start_obs, t_geos, t_injection, rot_axis=[0,0,1], M=consts.sgra_mass, t_units=None, use_jax=False):
     """
     Generate an coordinate transoform for the velocity warp.
     
     Parameters
     ----------
-    grid: list of np arrays
+    coords: list of np arrays
         A list of arrays with grid coordinates
-    t: float, 
-        time.
-    angular_velocity: float or function, 
-        Either a homogeneous velocity field (float) or a function of "r"/"radius".
-    rot_axis: 3d vector, 
-        Rotation axis.
-    tstart: float, default=0.0
-        Start time of frame zero.
+    Omega: array, 
+        Angular velocity array sampled along the coords points.
+    t_frames: array, 
+        Array of time for each image frame with astropy.units
+    t_start_obs: astropy.Quantity, default=None
+        Start time for observations, if None t_frames[0] is assumed to be start time.
+    t_geos: array, 
+        Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
+    t_injection: float, 
+        Time of hotspot injection in M units.
+    rot_axis: array, default=[0, 0, 1]
+        Currently only equitorial plane rotation is supported
+    M: astropy.Quantity, default=constants.sgra_mass,
+        Mass of the black hole used to convert frame times to space-time times in units of M
+    t_units: astropy.units, default=None,
+        Time units. If None units are taken from t_frames.
     use_jax: bool, default=False,
         Using jax enables GPU accelerated computing.
         
     Returns
     -------
-    warped_coords: np.array,
+    warped_coords: array,
         An array with the new coordinates for the warp transformation.
     """
     _np = jnp if use_jax else np
-    radius = _np.sqrt(_np.sum(_np.array([dim**2 for dim in grid]), axis=0) + _np.finfo(_np.float32).eps)
-    t_relative = (t - tstart)
-    # assert t_relative >= 0, 'time t ({}) is before start time ({})'.format(t, tstart)
+    coords = _np.array(coords)
+    Omega = _np.array(Omega)
     
-    if _np.isscalar(angular_velocity):
-        velocity = angular_velocity
+    if isinstance(t_start_obs, units.Quantity):
+        t_units = t_start_obs.unit
+        t_start_obs = t_start_obs.value
 
-    elif callable(angular_velocity):
-        args = {}
-        params = signature(angular_velocity).parameters.keys()
-        if ('radius' in params): args['radius'] = radius
-        if ('theta' in params): args['theta'] = theta
-        if ('r' in params): args['r'] = radius
-        velocity = angular_velocity(**args)
-        
-    # Fill NaNs with zeros
-    velocity = _np.where(_np.isfinite(velocity), velocity, _np.zeros_like(velocity))
-    theta_rot = t_relative * velocity
+    elif t_units is None:
+        raise AttributeError("Units should be set either through t_start_obs or t_units arguments")
+
+    if isinstance(t_frames, units.Quantity):
+        t_frames = t_frames.to(t_units).value
+    t_frames = _np.array(t_frames)
+
+    if (_np.isscalar(Omega) or Omega.ndim == 0):
+        Omega = utils.expand_dims(Omega, coords.ndim-1, axis=-1, use_jax=use_jax)
+
+    # Extend the dimensions of `t_frames` and `coords' for an array of times 
+    if not (t_frames.ndim == 0):
+        coords = utils.expand_dims(coords, coords.ndim + t_frames.ndim, 1, use_jax)
+        t_frames = utils.expand_dims(t_frames, t_frames.ndim + Omega.ndim, -1, use_jax)
+
+    # Convert time units to grid units
+    GM_c3 = consts.GM_c3(M).to(t_units)
+    t_geos = (t_frames - t_start_obs)/GM_c3.value + _np.array(t_geos)
+    t_M = t_geos - t_injection
     
-    if len(grid) == 2:
-        inv_rot_matrix = _np.array([[_np.cos(theta_rot), -_np.sin(theta_rot)], 
-                                    [_np.sin(theta_rot), _np.cos(theta_rot)]])
-    elif len(grid) == 3:
-        inv_rot_matrix = utils.rotation_matrix(rot_axis, -theta_rot, use_jax=use_jax)
-    else:
-        raise AttributeError('grid dimensions not supported')
+    # Insert nans for angles before the injection time
+    theta_rot = _np.array(t_M * Omega)
+    theta_rot = _np.where(t_M < 0.0, _np.full_like(theta_rot, fill_value=np.nan), theta_rot)
+
+    inv_rot_matrix = utils.rotation_matrix(rot_axis, -theta_rot, use_jax=use_jax)
         
-    coords = _np.stack(grid)
-    if (inv_rot_matrix.ndim == 2):
-        warped_coords = _np.einsum('ij,{}'.format('jklm'[:coords.ndim]), inv_rot_matrix, coords)
-    else:
-        warped_coords = _np.sum(inv_rot_matrix * coords, axis=1)
+    warped_coords = _np.sum(inv_rot_matrix * coords, axis=1)
     warped_coords = _np.moveaxis(warped_coords, 0, -1)
-    
     return warped_coords
 
-def integrate_rays(emission, sensor, doppler_factor=1.0, dim='geo'):
+def interpolate_coords(emission, coords):
     """
-    Integrate emission over rays to get sensor pixel values.
+    Interpolate 3D emission field along the given coordinates
     
     Parameters
     ----------
-    emission: xr.DataArray,
-        A DataArray with emission values.
-    sensor: xr.Dataset
-        A Dataset with ray geomeries for integration. 
-    doppler_factor: np.array, default=1.0
-        Multiply emission by a doppler factor (relativistic beaming) 
-    dim: str, default='geo'
-        Name of the dimension along which integration is carried out. 
-        The default corresponds to the dimension name used when generating a sensor.
+    emission_0: np.array
+        3D array with emission values
+    coords: [x, y, z], 
+        A list of coordinate arrays.
         
     Returns
     -------
-    pixels: xr.DataArray,
-        An DataArray with pixel values (e.g. fluxes).
+    interpolated_data: array, 
+        An array with emission values interpolated onto the coordinates.
     """
-    sensor = sensor.fillna(-1e9)
-    coords = {'x': sensor.x, 'y': sensor.y}
-    if 'z' in emission.dims:
-        coords['z'] = sensor.z
-    inteporlated_values = emission.interp(coords) * doppler_factor
-    pixels = (inteporlated_values.fillna(0.0) * sensor.deltas).sum(dim)
-    return pixels
+    fov = [(emission[dim].max() - emission[dim].min()).data for dim in emission.dims]
+    npix = [emission[dim].size for dim in emission.dims]
+    image_coords = np.moveaxis(utils.world_to_image_coords(coords, fov=fov, npix=npix), -1, 0)
+    interpolated_data = skimage.transform.warp(emission, image_coords, mode='constant', cval=0.0, order=3)
+    return interpolated_data
 
-def zero_unsupervised_emission(emission, coords, rmin=0, rmax=np.Inf):
+def radiative_trasfer(emission, g, dtau, Sigma, use_jax=False):
     """
-    Zero emission that is not within the supervision region
+    Integrate emission over rays to get sensor pixel values.
+
+    Parameters
+    ----------
+    emission: array,
+        An array with emission values.
+    g: array, 
+        doppler boosting factor, 
+    dtau: array, 
+        mino time differential
+    Sigma: array, 
+    use_jax: bool, default=False,
+        Using jax enables GPU accelerated computing.
+        
+    Returns
+    -------
+    radiance: array, 
+        An array with pixel flux values.
+    """
+    g = utils.expand_dims(g, emission.ndim, use_jax=use_jax)
+    dtau = utils.expand_dims(dtau, emission.ndim, use_jax=use_jax)
+    Sigma = utils.expand_dims(Sigma, emission.ndim, use_jax=use_jax)
+    fluxes = (g**2 * emission * dtau * Sigma).sum(axis=-1)
+    return fluxes
+
+def image_plane_dynamics(emission_0, geos, t_frames, t_injection, t_start_obs=None, rot_axis=[0,0,1], M=consts.sgra_mass):
+    """
+    Compute the image-plane dynamics (movie) for a given initial emission and geodesics.
+    
+    Parameters
+    ----------
+    emission_0: np.array
+        3D array with emission values
+    geos: xr.Dataset
+        A dataset specifying geodesics (ray trajectories) ending at the image plane.
+    t_frames: array, 
+        Array of time for each image frame with astropy.units
+    t_injection: float, 
+        Time of hotspot injection in M units.
+    t_start_obs: astropy.Quantity, default=None
+        Start time for observations, if None t_frames[0] is assumed to be start time.
+    rot_axis: array, default=[0, 0, 1]
+        Currently only equitorial plane rotation is supported
+    M: astropy.Quantity, default=constants.sgra_mass,
+        Mass of the black hole used to convert frame times to space-time times in units of M
+        
+    Returns
+    -------
+    movie: np.array
+        A movie array with image-plane frames
+    """
+    warped_coords = velocity_warp_coords(
+        coords=[geos.x, geos.y, geos.z],
+        Omega=geos.Omega, 
+        t_frames=t_frames, 
+        t_start_obs=t_frames[0] if t_start_obs is None else t_start_obs, 
+        t_geos=geos.t, 
+        t_injection=t_injection, 
+        rot_axis=rot_axis, 
+        M=M  
+    )
+    emission = interpolate_coords(emission_0, warped_coords)
+    movie = radiative_trasfer(emission, np.array(geos.g), np.array(geos.dtau), np.array(geos.Sigma))
+    return movie
+
+def fill_unsupervised_emission(emission, coords, rmin=0, rmax=np.Inf, fill_value=0.0, use_jax=False):
+    """
+    Fill emission that is not within the supervision region
     
     Parameters
     ----------
@@ -204,120 +344,18 @@ def zero_unsupervised_emission(emission, coords, rmin=0, rmax=np.Inf):
         Zero values at radii < rmin
     rmax: float, default=np.inf
         Zero values at radii > rmax
+    fill_value: float, default=0.0
+        Fill value is default to zero 
+    use_jax: bool, default=False,
+        Using jax enables GPU accelerated computing.
         
     Returns
     -------
     emission: np.array
-        3D array with zeroed down emission values
+        3D array with emission values filled in
     """
-    emission = np.squeeze(emission)
-    r = np.sum([np.squeeze(x)**2 for x in coords], axis=0)
-    emission = jnp.where(r < rmin**2, jnp.zeros_like(emission), emission)
-    emission = jnp.where(r > rmax**2, jnp.zeros_like(emission), emission)
+    _np = jnp if use_jax else np
+    r_sq = _np.sum(_np.array([_np.squeeze(x)**2 for x in coords]), axis=0)
+    emission = _np.where(r_sq < rmin**2, _np.full_like(emission, fill_value=fill_value), emission)
+    emission = _np.where(r_sq > rmax**2, _np.full_like(emission, fill_value=fill_value), emission)
     return emission
-
-def doppler_factor(sensor, rot_axis, angular_velocity):
-    """
-    Compute the Doppler factor due to relativistic beaming
-    
-    Parameters
-    ----------
-    sensor: xr.Dataset
-        A Dataset with ray geomeries for integration. 
-    rot_axis: 3d vector, 
-        Rotation axis of the azimuthal velocity field.
-    angular_velocity: float or function, 
-        Either a homogeneous velocity field (float) or a function of "r"/"radius".
-        
-    Returns
-    -------
-    doppler_factor: np.array
-        Array with doppler multiplicative factor.
-    """
-    
-    sensor = sensor.fillna(-1e9)
-    coords = {'x': sensor.x, 'y': sensor.y}
-    if 'z' in sensor.variables:
-        coords['z'] = sensor.z
-    radius = sensor.r
-
-    if np.isscalar(angular_velocity):
-        linear_velocity = radius * angular_velocity
-
-    elif callable(angular_velocity):
-        args = {}
-        params = signature(angular_velocity).parameters.keys()
-        if ('radius' in params): args['radius'] = radius
-        if ('theta' in params): args['theta'] = theta
-        if ('r' in params): args['r'] = radius
-        linear_velocity = radius * angular_velocity(**args)
-
-    linear_velocity = linear_velocity.fillna(0.0)
-    linear_velocity *= (consts.G*consts.sgra.mass/consts.c**2) / 3600.0 # unit conversion to [m/s]
-    beta = linear_velocity / consts.c
-
-    # Emission velocity direction vector
-    r_vector = np.stack([sensor.x, sensor.y, np.zeros_like(sensor.z)])
-    r_vector = r_vector / (np.linalg.norm(r_vector, axis=0) + 1e-8)
-    e_vx, e_vy, e_vz = np.cross(rot_axis, r_vector, axis=0)
-    doppler_cosine = -sensor.vx*e_vx - sensor.vy*e_vy - sensor.vz*e_vz
-
-    doppler_factor = np.sqrt(1 - beta**2) / (1 - doppler_cosine * beta)
-    
-    return doppler_factor
-
-def load_sensor(spin, inclination, ngeo=100, num_alpha=64, num_beta=64, distance=1000.0, max_r=6.0):
-    """
-    Compute sensor rays for a given spin and inclination
-    
-    Parameters
-    ----------
-    spin: float
-        normalized spin value in range [0,1]
-    inclination: float, 
-        inclination angle in [rad] in range [0, pi/2]
-    ngeo: int, default=100
-        Number of points along a ray
-    num_alpha: int, default=64,
-        Number of pixels in the vertical direction
-    num_beta: int, default=64,
-        Number of pixels in the horizontal direction   
-    distance: float, default=1000.0
-        Distance to observer
-    max_r: float, default=6.0, 
-        maximum radius for integration (in units of GM/c^2)
-    
-    Returns
-    -------
-    sensor: xr.Dataset
-        A dataset specifying ray pahts for the sensor.
-        
-    Notes
-    -----
-    units are in GM/c^2
-    """
-    from kgeo import raytrace_ana
-    
-    alpha, beta = np.meshgrid(np.linspace(-8.0, 8.0, num_alpha), np.linspace(-8.0, 8.0, num_beta))
-    image_coords = [alpha.ravel(), beta.ravel()]
-    observer_coords = [0, distance, inclination, 0]
-    sensor = raytrace_ana(spin, observer_coords, image_coords, ngeo+1, plotdata=False).get_dataset()
-    sensor = sensor.isel(geo=range(ngeo))
-    sensor.attrs.update(num_alpha=num_alpha, num_beta=num_beta)
-
-    # Path direction vector
-    vx, vy, vz = vx/piecwise_dist, vy/piecwise_dist, vz/piecwise_dist
-    vx = xr.concat((xr.zeros_like(sensor.x.isel(geo=0)), vx), dim='geo').fillna(0.0)
-    vy = xr.concat((xr.zeros_like(sensor.y.isel(geo=0)), vy), dim='geo').fillna(0.0)
-    vz = xr.concat((xr.zeros_like(sensor.z.isel(geo=0)), vz), dim='geo').fillna(0.0)
-    sensor = sensor.assign(vx=vx, vy=vy, vz=vz)
-
-    piecwise_dist = xr.concat((xr.zeros_like(sensor.x.isel(geo=0)), piecwise_dist), dim='geo').fillna(0.0)
-    sensor = sensor.assign(deltas=piecwise_dist)
-    
-    for key, data_var in sensor.data_vars.items():
-        if data_var.dims == sensor.r.dims:
-            sensor[key] = data_var.where(sensor.r < max_r)
-    sensor = sensor.fillna(0.0)
-    
-    return sensor

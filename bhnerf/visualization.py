@@ -9,6 +9,134 @@ import jax
 from jax import numpy as jnp
 import functools
 
+def slider_frame_comparison(frames1, frames2, scale='amp'):
+    """
+    Slider comparison of two 3D xr.DataArray along a chosen dimension.
+    Parameters
+    ----------
+    frames1: xr.DataArray
+        A 3D DataArray with 't' dimension to compare along
+    frames2:  xr.DataArray
+        A 3D DataArray with 't' dimension to compare along
+    scale: 'amp' or 'log', default='amp'
+        Compare absolute values or log of the fractional deviation.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(9, 3))
+    plt.tight_layout()
+    mean_images = [frames1.mean(axis=0), frames2.mean(axis=0),
+                   (np.abs(frames1 - frames2)).mean(axis=0)]
+    cbars = []
+    titles = [None]*3
+    titles[0] = frames1.name if frames1.name is not None else 'Movie1'
+    titles[1] = frames2.name if frames2.name is not None else 'Movie2'
+    if scale == 'amp':
+        titles[2] = 'Absolute difference'
+    elif scale == 'log':
+        titles[2] = 'Log relative difference'
+
+    for ax, image in zip(axes, mean_images):
+        im = ax.imshow(image)
+        ax.get_xaxis().set_visible(False)
+        ax.get_yaxis().set_visible(False)
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes('right', size='5%', pad=0.05)
+        cbars.append(fig.colorbar(im, cax=cax))
+
+    def imshow_frame(frame):
+        image1 = frames1[frame]
+        image2 = frames2[frame]
+
+        if scale == 'amp':
+            image3 = np.abs(frames1[frame] - frames2[frame])
+        elif scale == 'log':
+            image3 = np.log(np.abs(frames1[frame] / frames2[frame]))
+
+        for ax, img, title, cbar in zip(axes, [image1, image2, image3], titles, cbars):
+            ax.imshow(img, origin='lower')
+            ax.set_title(title)
+            cbar.mappable.set_clim([img.min(), img.max()])
+
+    num_frames = min(frames1.t.size, frames2.t.size)
+    plt.tight_layout()
+    interact(imshow_frame, frame=(0, num_frames-1));
+    
+def plot_geodesic_3D(data_array, geos, method='interact', max_r=10, figsize=(5,5), init_alpha=0, 
+                     init_beta=0, vmin=None, vmax=None, cbar_shrink=0.65, fps=10, horizon=True, isco=False):
+    
+    from mpl_toolkits.mplot3d.art3d import Line3DCollection
+    from mpl_toolkits.mplot3d import Axes3D
+    import ipywidgets as widgets
+    
+    def update(ialpha, ibeta, vmin, vmax):
+        trajectory = geos.isel(alpha=ialpha, beta=ibeta)
+        values = data_array.isel(alpha=ialpha, beta=ibeta)
+        trajectory = trajectory.where(trajectory.r < 2*max_r)
+        x, y, z = trajectory.x.data, trajectory.y.data, trajectory.z.data
+        points = np.array([x, y, z]).T.reshape(-1, 1, 3)
+        segments = np.concatenate([points[:-1], points[1:]], axis=1)
+        lc.set_segments(segments)
+        lc.set_array(values)
+        if vmin is None:
+            vmin = values.min()
+        if vmax is None:
+            vmax = values.max()
+        lc.set_clim([vmin, vmax])
+        ax.set_title('alpha={}, beta={}'.format(values.alpha, values.beta))
+        return lc,
+        
+    if method not in ['interact', 'static', 'animate']:
+        raise AttributeError('undefined method: {}'.format(method))
+    
+    fig = plt.figure()
+    ax = plt.subplot(projection='3d')
+    ax.set_xlim([-max_r, max_r])
+    ax.set_ylim([-max_r, max_r])
+    ax.set_zlim([-max_r, max_r])
+    
+    # Plot the black hole event horizon (r_plus) 
+    if horizon:
+        r_plus = float(1 + np.sqrt(1 - geos.spin**2))
+        u = np.linspace(0, 2 * np.pi, 100)
+        v = np.linspace(0, np.pi, 100)
+        x = np.outer(np.cos(u), np.sin(v))
+        y = np.outer(np.sin(u), np.sin(v))
+        z = np.outer(np.ones(np.size(u)), np.cos(v))
+        ax.plot_surface(r_plus*x, r_plus*y, r_plus*z, linewidth=0.0, color='black')
+
+    # Plot the ISCO as a wire-frame
+    if isco:
+        from bhnerf import constants
+        r_isco = float(constants.isco_pro(geos.spin))
+        ax.plot_wireframe(r_isco*x, r_isco*y, r_isco*z, rcount=10, ccount=10, linewidth=0.3)
+    
+
+    trajectory = geos.isel(alpha=init_alpha, beta=init_beta)
+    values = data_array.isel(alpha=init_alpha, beta=init_beta)
+    trajectory = trajectory.where(trajectory.r < 2*max_r)
+    x, y, z = trajectory.x.data, trajectory.y.data, trajectory.z.data
+
+    points = np.array([x, y, z]).T.reshape(-1, 1, 3)
+    segments = np.concatenate([points[:-1], points[1:]], axis=1)
+
+    lc = Line3DCollection(segments, cmap='viridis')
+    lc.set_array(values)
+    lc.set_clim([vmin, vmax])
+    lc.set_linewidth(2)
+
+    line = ax.add_collection3d(lc)
+    cb = fig.colorbar(line, ax=ax, shrink=cbar_shrink, location='left')
+
+    output = fig
+    if method == 'interact':
+        widgets.interact(update, ialpha=(0, geos.alpha.size-1), ibeta=(0, geos.beta.size-1),
+                         vmin=widgets.fixed(vmin), vmax=widgets.fixed(vmax)) 
+    if method == 'animate':
+        raise NotImplementedError
+        # output = animation.FuncAnimation(fig, lambda pix: update(pix, vmin, vmax), 
+        #                                 frames=geos.pix.size-1, interval=1e3 / fps)
+    return output
+
+        
 def animate_synced(movie, measurements, axes, t_dim='t', vmin=None, vmax=None, cmap='RdBu_r', add_ticks=True,
                    add_colorbar=True, title=None, fps=10, output=None):
 
@@ -181,13 +309,13 @@ class _VisualizationAccessor(object):
                   movie[image_dims[1]].min(), movie[image_dims[1]].max()]
 
         im = ax.imshow(movie.isel({t_dim: 0}), extent=extent, cmap=cmap)
-        divider = _make_axes_locatable(ax)
+        divider = make_axes_locatable(ax)
         cax = divider.append_axes('right', size='5%', pad=0.05)
         cbar = fig.colorbar(im, cax=cax)
 
         def imshow_frame(frame):
             img = movie.isel({t_dim: frame})
-            ax.imshow(img, origin='lower', extent=extent, cmap=cmap)
+            im.set_array(movie.isel({t_dim: frame}))
             cbar.mappable.set_clim([img.min(), img.max()])
 
         interact(imshow_frame, frame=(0, num_frames-1));
@@ -308,7 +436,7 @@ class VolumeVisualizer(object):
                                                   jnp.zeros_like(self._pts[...,-1:,:])], 
                                                  axis=2), axis=-1)
     
-    def render(self, emission, jit=False, bh_radius=0.0, norm_const=1.0, facewidth=10., linewidth=0.1, bh_albedo=[0,0,0], cmap='hot'):
+    def render(self, emission, facewidth, jit=False, bh_radius=0.0, norm_const=1.0, linewidth=0.1, bh_albedo=[0,0,0], cmap='hot'):
         """
         Render an image of the 3D emission
         
@@ -386,6 +514,11 @@ class VolumeVisualizer(object):
         t_vals = jnp.linspace(near, far, num_samples)
         pts = rays_o[..., None, :] + t_vals[None, None, :, None] * rays_d[..., None, :]
         return pts
+    
+    @property
+    def coords(self):
+        coords = None if self._pts is None else jnp.moveaxis(self._pts, -1, 0)
+        return coords
 
 def alpha_composite(emission, dists, pts, bh_rad, inside_halfwidth=4.5):
     emission = np.clip(emission, 0., 1.)

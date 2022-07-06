@@ -6,6 +6,11 @@ from jax import numpy as jnp
 from typing import Any, Callable
 import functools
 import bhnerf
+from jax import jit
+import optax
+
+from flax.training import train_state
+from flax.training import checkpoints
 
 safe_sin = lambda x: jnp.sin(x % (100 * jnp.pi))
 
@@ -82,8 +87,18 @@ def posenc(x, deg):
                      list(x.shape[:-1]) + [-1])
     four_feat = safe_sin(jnp.concatenate([xb, xb + 0.5 * jnp.pi], axis=-1))
     return jnp.concatenate([x] + [four_feat], axis=-1)
-    
-class NeRF_RotationAxis(nn.Module):
+
+def shard(xs):
+    """Split data into shards for multiple devices along the first dimension."""
+    return jax.tree_map(lambda x: x.reshape((jax.local_device_count(), -1) + x.shape[1:]), xs)
+
+def flattened_traversal(fn):
+    def mask(data):
+        flat = flax.traverse_util.flatten_dict(data)
+        return flax.traverse_util.unflatten_dict({k: fn(k, v) for k, v in flat.items()})
+    return mask
+
+class NeRF_Predictor(nn.Module):
     """
     Full function to predict emission at a time step.
     
@@ -104,172 +119,522 @@ class NeRF_RotationAxis(nn.Module):
     do_skip: bool = True
     
     @nn.compact
-    def __call__(self, coordinates, velocity, tstart, axis_init):
+    def __call__(self, t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection):
         """
+        Sample emission on given coordinates at specified times assuming a velocity model (Omega)
+        
         Parameters
         ----------
-        coordinates: list of arrays, 
-            1. For 3D emission coords=[t, x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
-               alpha, beta are image coordinates. These arrays contain the ray integration points
-            2. For 2D emission coords=[t, x, y] with each array shape=(nt, num_alpha, ngeo)
+        t_frames: array, 
+            Array of time for each image frame
+        t_units: astropy.units, 
+            Time units of t_frames.
+        coords: list of arrays, 
+            For 3D emission coords=[x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
+            alpha, beta are image coordinates. These arrays contain the ray integration points
+        Omega: array, 
+            Angular velocity array sampled along the coords points
+        t_start_obs: astropy.Quantity, default=None
+            Start time for observations, if None t_frames[0] is assumed to be start time.
+        t_geos: array, 
+            Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
+        t_injection: float, 
+            Time of hotspot injection in M units.
+        
+        Returns
+        -------
+        emission: jnp.array,
+            An array with the emission points
         """
         emission_MLP = MLP(self.net_depth, self.net_width, self.activation, self.out_channel, self.do_skip)
-        
-        def predict_emission(coordinates, velocity, axis, tstart):
-            net_input = bhnerf.emission.velocity_warp(
-                coordinates[1:], coordinates[0], velocity, axis, tstart, use_jax=True)
-            valid_inputs_mask = jnp.isfinite(net_input)
-            net_input = jnp.where(valid_inputs_mask, net_input, jnp.zeros_like(net_input))
+        def predict_emission(t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection):
+            warped_coords = bhnerf.emission.velocity_warp_coords(
+                coords, Omega, t_frames, t_start_obs, t_geos, t_injection, t_units=t_units, use_jax=True
+            )
+            
+            # Zero emission prior to injection time
+            valid_inputs_mask = jnp.isfinite(warped_coords)
+            net_input = jnp.where(valid_inputs_mask, warped_coords, jnp.zeros_like(warped_coords))
             net_output = emission_MLP(posenc(net_input, self.posenc_deg))
-            emission = nn.sigmoid(net_output[..., 0] - 10.)
+            emission = nn.sigmoid(net_output[..., 0] - 10.0)
             emission = jnp.where(valid_inputs_mask[..., 0], emission, jnp.zeros_like(emission))
+            
             return emission
         
-        axis = self.param('axis', lambda key, values: jnp.array(values, dtype=jnp.float32), axis_init)
-        emission = predict_emission(coordinates, velocity, axis, tstart)
-
+        emission = predict_emission(t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection)
         return emission
-
-class EmissionOperator(object):
-    def __init__(self, predictor, kwargs):
-        self.predictor = predictor
-        self.kwargs = kwargs
-
-    def __call__(self, params, coordinates):
-        output = self.predictor.apply({'params': params}, coordinates, **self.kwargs)
-        return output
     
-    
-class ImagePlaneOperator(object):
-    def __init__(self, emission_op):
-        """
-        Image Plane operator takes in network parameters, coordinates to produce image pixels.
-        
-        Parameters
-        ----------
-        emission_op: EmissionOperater, 
-            The emission_op samples emission from the neural network along specified grid points. 
-        """
-        self.emission_op = emission_op
-
-    def __call__(self, params, coordinates, path_lengths):
-        """
-        Generate image-plane pixels for a given network (emission operator).
-        
-        Parameters
-        ----------
-        params, FrozenDict, 
-            A dictionary with the neural network parameters.
-        coordinates: list of arrays, 
-            1. For 3D emission coords=[t, x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
-               alpha, beta are image coordinates. These arrays contain the ray integration points
-            2. For 2D emission coords=[t, x, y] with each array shape=(nt, num_alpha, ngeo)
-        path_lengths: array,
-            Path lengths for integration, shape=(nt, num_alpha, num_beta, ngeo)
-        Returns
-        -------
-        images: array, 
-            Image plane pixels.
-        """
-        emission = self.emission_op(params, coordinates)
-        images = jnp.sum(emission * path_lengths, axis=-1)
-        return images   
-    
-class VisibilityOperator(ImagePlaneOperator):
-    def __init__(self, emission_op):
-        """
-        Visibility operator takes in network parameters, coordinates, dtft matrices 
-        to produce visibility measurements.
-        
-        Parameters
-        ----------
-        emission_op: EmissionOperater, 
-            The emission_op samples emission from the neural network along specified grid points. 
-        """
-        super().__init__(emission_op)
-
-    def __call__(self, params, coordinates, path_lengths, dtft_matrices):
-        """
-        Generate visibility measurements for a given network state and frequency sampling pattern.
-        
-        Parameters
-        ----------
-        params, FrozenDict, 
-            A dictionary with the neural network parameters.
-        coordinates: list of arrays, 
-            For 3D emission coords=[t, x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
-            alpha, beta are image coordinates. These arrays contain the ray integration points
-        path_lengths: array,
-            Path lengths for integration, shape=(nt, num_alpha, num_beta, ngeo)
-        dtft_matrices: array, shape=(nt, nfreq, npix)
-            Here nfreq is the (maximum) number of frequencies sampled at a given observation time and npix=num_alpha*num_beta.
-            This array contains all the dtft matrices. 
-            
-        Returns
-        -------
-        visibilities: array, shape=(nt, nfreq), 
-            Complex visibilities at all observation times.
-        images: array, shape=(nt, num_alpha, num_beta)
-            Image plane measurements.
-        """
-        images = super().__call__(params, coordinates, path_lengths)
-        visibilities = jnp.stack([jnp.matmul(ft, image.ravel()) for ft, image in zip(dtft_matrices, images)])
-        return visibilities, images     
-
-def shard(xs):
-    """Split data into shards for multiple devices along the first dimension."""
-    return jax.tree_map(lambda x: x.reshape((jax.local_device_count(), -1) + x.shape[1:]), xs)
-
-def flattened_traversal(fn):
-    def mask(data):
-        flat = flax.traverse_util.flatten_dict(data)
-        return flax.traverse_util.unflatten_dict({k: fn(k, v) for k, v in flat.items()})
-    return mask
-
-def get_input_coords(sensor, t_array, ngeo=None, npix=None, batch='rays'):
+def loss_fn_image(params, predictor_fn, target, t_frames, t_units, coords, Omega, 
+                  g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax):
     """
-    Get input coordinates for optimization.
-    
+    An L2 loss function for image pixels
+
     Parameters
     ----------
-    sensor: xarray.Dataset
-        A dataset with dimensions (geo, pix) and variables: x, y, z, t, deltas. 
-        These are the ray coordinates and deltas are the segments lengths used for integration.
-    t_array: np.array,
-        An array with the measurement times.
-    ngeo: int, default=None
-        Number of sample points along a ray. If None it is taken from the sensor attributes.
-    npix: int, default=None
-        Number of pixels/rays. If None it is taken from the sensor attributes.
-    batch: 'rays' or 't', default='rays'
-        'rays' used to batch (along first axis) single rays.
-        't' used to batch whole images (needed for Fourier transform).
+    params: dict, 
+        A dictionary with network parameters (from state.params)
+    predictor_fn: nn.Module
+        A coordinate-based neural net for predicting the emission values as a continuous function
+    target: array, 
+        Target images to fit the model to. 
+    t_frames: array, 
+        Array of time for each image frame
+    t_units: astropy.units, 
+        Time units for t_frames.
+    coords: list of arrays, 
+        For 3D emission coords=[x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
+        alpha, beta are image coordinates. These arrays contain the ray integration points
+    Omega: array, 
+        Angular velocity array sampled along the coords points
+    g: array, 
+        doppler boosting factor, 
+    dtau: array, 
+        mino time differential
+    Sigma: array, 
+    t_start_obs: astropy.Quantity, default=None
+        Start time for observations, if None t_frames[0] is assumed to be start time.
+    t_geos: array, 
+        Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
+    t_injection: float, 
+        Time of hotspot injection in M units.
+    rmin: float, 
+        The minimum radius for recovery
+    rmax: float, 
+        The maximum radius for recovery
+        
+    Returns
+    -------
+    loss: jnp.array,
+        An array with loss values (the size is the number of GPUs)
+    images: jnp.array
+        An array of predicted images at different times (t_frames)
+    """
+    emission = predictor_fn({'params': params}, t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection)
+    emission = bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax, use_jax=True)
+    images = bhnerf.emission.radiative_trasfer(emission, g, dtau, Sigma, use_jax=True)
+    loss = jnp.mean(jnp.abs(images - target)**2)
+    return loss, [images]
+
+def loss_fn_eht(params, predictor_fn, target, t_frames, t_units, coords, Omega, 
+                g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, dtft_mats, vis_sigma):
+    """
+    An chi-square loss function for EHT observations
+
+    Parameters
+    ----------
+    params: dict, 
+        A dictionary with network parameters (from state.params)
+    predictor_fn: nn.Module
+        A coordinate-based neural net for predicting the emission values as a continuous function
+    target: array, 
+        Target images to fit the model to. 
+    t_frames: array, 
+        Array of time for each image frame
+    t_units: astropy.units, 
+        Time units for t_frames.
+    coords: list of arrays, 
+        For 3D emission coords=[x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
+        alpha, beta are image coordinates. These arrays contain the ray integration points
+    Omega: array, 
+        Angular velocity array sampled along the coords points
+    g: array, 
+        doppler boosting factor, 
+    dtau: array, 
+        mino time differential
+    Sigma: array, 
+    t_start_obs: astropy.Quantity, default=None
+        Start time for observations, if None t_frames[0] is assumed to be start time.
+    t_geos: array, 
+        Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
+    t_injection: float, 
+        Time of hotspot injection in M units.
+    rmin: float, 
+        The minimum radius for recovery
+    rmax: float, 
+        The maximum radius for recovery
+    dtft_mats: array,
+        An array of discrete time fourier transform matrices for each frame time
+    vis_sigma: array,
+        An array of standard deviations for each visibility measurement
     
     Returns
     -------
-    coordinates: dict,
-        A dictionary with keys: t, x, y, z, d.
-    """
-    ngeo = ngeo if ngeo else sensor.geo.size
-    npix = npix if npix else sensor.pix.size
-    nt = len(t_array)
-    
-    if batch == 'rays':
-        data_shape = [nt * npix, ngeo]
-    elif batch == 't': 
-        data_shape = [nt, sensor.num_alpha, sensor.num_beta, ngeo]
+    loss: jnp.array,
+        An array with loss values (the size is the number of GPUs)
+    images: jnp.array
+        An array of predicted images at different times (t_frames)
         
-    if 't' in sensor:
-        sensor = sensor.drop('t')
-    interpolated_sensor = sensor.interp(geo=np.linspace(0, sensor.geo.size-1, ngeo),
-                                        pix=np.linspace(0, sensor.pix.size-1, npix))
-    interpolated_sensor = interpolated_sensor.expand_dims(t=range(nt))
-    t = np.broadcast_to(t_array[:, None, None], [nt, npix, ngeo])
-    coordinates = {
-        't': t.reshape(*data_shape),
-        'x': interpolated_sensor.x.data.reshape(*data_shape),
-        'y': interpolated_sensor.y.data.reshape(*data_shape),
-        'z': interpolated_sensor.z.data.reshape(*data_shape),
-        'd': interpolated_sensor.deltas.data.reshape(*data_shape)
-    }
-    return coordinates
+    Notes
+    -----
+    Currently only supports complex visibilities
+    """
+    emission = predictor_fn({'params': params}, t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection)
+    emission = bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax, use_jax=True)
+    images = bhnerf.emission.radiative_trasfer(emission, g, dtau, Sigma, use_jax=True)
+    visibilities = jnp.stack([jnp.matmul(ft, image.ravel()) for ft, image in zip(dtft_mats, images)])
+    loss = jnp.mean((jnp.abs(visibilities - target)/vis_sigma)**2)
+    return loss, [images]
+
+@functools.partial(jit, static_argnums=(3))
+def train_step_image(state, target, t_frames, t_units, coords, Omega, g, dtau, Sigma,
+                     t_start_obs, t_geos, t_injection, rmin, rmax):
+    """
+    Training step function for fitting the image-plane directly
+    
+    Parameters
+    ----------
+    state: flax.training.train_state.TrainState, 
+        The training state holding the network parameters and apply_fn
+    target: array, 
+        Target images to fit the model to. 
+    t_frames: array, 
+        Array of time for each image frame
+    t_units: astropy.units, 
+        Time units for t_frames.
+    coords: list of arrays, 
+        For 3D emission coords=[x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
+        alpha, beta are image coordinates. These arrays contain the ray integration points
+    Omega: array, 
+        Angular velocity array sampled along the coords points
+    g: array, 
+        doppler boosting factor, 
+    dtau: array, 
+        mino time differential
+    Sigma: array, 
+    t_start_obs: astropy.Quantity, default=None
+        Start time for observations, if None t_frames[0] is assumed to be start time.
+    t_geos: array, 
+        Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
+    t_injection: float, 
+        Time of hotspot injection in M units.
+    rmin: float, 
+        The minimum radius for recovery
+    rmax: float, 
+        The maximum radius for recovery
+    dtft_mats: array,
+        An array of discrete time fourier transform matrices for each frame time
+    vis_sigma: array,
+        An array of standard deviations for each visibility measurement
+    
+    Returns
+    -------
+    loss: jnp.array,
+        An array with loss values (the size is the number of GPUs)
+    images: jnp.array
+        An array of predicted images at different times (t_frames)
+        
+    Notes
+    -----
+    Arguments for jax.pmap:
+        axis_name='batch',
+        in_axes=(0, 0, 0, None, None, None, None, None, None, None, None, None, None, None)
+        static_broadcasted_argnums=(3),
+    """
+    (loss, [images]), grads = jax.value_and_grad(loss_fn_image, argnums=(0), has_aux=True)(
+        state.params, state.apply_fn, target, t_frames, t_units, coords, Omega, g, dtau, Sigma, 
+        t_start_obs, t_geos, t_injection, rmin, rmax)
+    grads = jax.lax.pmean(grads, axis_name='batch')
+    state = state.apply_gradients(grads=grads)
+    return loss, state, images
+
+@functools.partial(jit, static_argnums=(3))
+def test_step_image(state, target, t_frames, t_units, coords, Omega, g, dtau, Sigma, 
+                    t_start_obs, t_geos, t_injection, rmin, rmax):
+    """
+    Test step function for fitting the image-plane directly. 
+    This function is identical to train_step_image except does not compute gradients or 
+    updates the state
+    
+    Parameters
+    ----------
+    state: flax.training.train_state.TrainState, 
+        The training state holding the network parameters and apply_fn
+    target: array, 
+        Target images to fit the model to. 
+    t_frames: array, 
+        Array of time for each image frame
+    t_units: astropy.units, 
+        Time units for t_frames.
+    coords: list of arrays, 
+        For 3D emission coords=[x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
+        alpha, beta are image coordinates. These arrays contain the ray integration points
+    Omega: array, 
+        Angular velocity array sampled along the coords points
+    g: array, 
+        doppler boosting factor, 
+    dtau: array, 
+        mino time differential
+    Sigma: array, 
+    t_start_obs: astropy.Quantity, default=None
+        Start time for observations, if None t_frames[0] is assumed to be start time.
+    t_geos: array, 
+        Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
+    t_injection: float, 
+        Time of hotspot injection in M units.
+    rmin: float, 
+        The minimum radius for recovery
+    rmax: float, 
+        The maximum radius for recovery
+    dtft_mats: array,
+        An array of discrete time fourier transform matrices for each frame time
+    vis_sigma: array,
+        An array of standard deviations for each visibility measurement
+    
+    Returns
+    -------
+    loss: jnp.array,
+        An array with loss values (the size is the number of GPUs)
+    images: jnp.array
+        An array of predicted images at different times (t_frames)
+        
+    Notes
+    -----
+    Arguments for jax.pmap:
+        axis_name='batch',
+        in_axes=(0, 0, 0, None, None, None, None, None, None, None, None, None, None, None)
+        static_broadcasted_argnums=(3),
+    """
+    loss, [images] = loss_fn_image(
+        state.params, state.apply_fn, target, t_frames, t_units, coords, Omega, g, dtau, Sigma, 
+        t_start_obs, t_geos, t_injection, rmin, rmax)
+    return loss, images
+
+@functools.partial(jit, static_argnums=(3))
+def train_step_eht(state, target, t_frames, t_units, coords, Omega, g, dtau, Sigma, t_start_obs, 
+                   t_geos, t_injection, rmin, rmax, dtft_mats, vis_sigma):
+    """
+    Train step function for fitting eht observations
+    This function computed gradients and updates the state. 
+    Currently only supports complex visibilities.
+    
+    Parameters
+    ----------
+    state: flax.training.train_state.TrainState, 
+        The training state holding the network parameters and apply_fn
+    target: array, 
+        Target eht observations to fit the model to. 
+    t_frames: array, 
+        Array of time for each image frame
+    t_units: astropy.units, 
+        Time units for t_frames.
+    coords: list of arrays, 
+        For 3D emission coords=[x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
+        alpha, beta are image coordinates. These arrays contain the ray integration points
+    Omega: array, 
+        Angular velocity array sampled along the coords points
+    g: array, 
+        doppler boosting factor, 
+    dtau: array, 
+        mino time differential
+    Sigma: array, 
+    t_start_obs: astropy.Quantity, default=None
+        Start time for observations, if None t_frames[0] is assumed to be start time.
+    t_geos: array, 
+        Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
+    t_injection: float, 
+        Time of hotspot injection in M units.
+    rmin: float, 
+        The minimum radius for recovery
+    rmax: float, 
+        The maximum radius for recovery
+    dtft_mats: array,
+        An array of discrete time fourier transform matrices for each frame time
+    vis_sigma: array,
+        An array of standard deviations for each visibility measurement
+    
+    Returns
+    -------
+    loss: jnp.array,
+        An array with loss values (the size is the number of GPUs)
+    images: jnp.array
+        An array of predicted images at different times (t_frames)
+        
+    Notes
+    -----
+    Arguments for jax.pmap:
+        axis_name='batch',
+        in_axes=(0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, 0, 0), 
+        static_broadcasted_argnums=(3),
+    """
+    (loss, [images]), grads = jax.value_and_grad(loss_fn_eht, argnums=(0), has_aux=True)(
+        state.params, state.apply_fn, target, t_frames, t_units, coords, Omega, g, dtau, Sigma, 
+        t_start_obs, t_geos, t_injection, rmin, rmax, dtft_mats, vis_sigma)
+    grads = jax.lax.pmean(grads, axis_name='batch')
+    state = state.apply_gradients(grads=grads)
+    return loss, state, images
+
+
+@functools.partial(jit, static_argnums=(3))
+def test_step_eht(state, target, t_frames, t_units, coords, Omega, g, dtau, Sigma, 
+                  t_start_obs, t_geos, t_injection, rmin, rmax, dtft_mats, vis_sigma):
+    """
+    Test step function for fitting eht observations
+    This function is identical to train_step_image except does not compute gradients or 
+    updates the state. Currently only supports complex visibilities.
+    
+    Parameters
+    ----------
+    state: flax.training.train_state.TrainState, 
+        The training state holding the network parameters and apply_fn
+    target: array, 
+        Target eht observations to fit the model to. 
+    t_frames: array, 
+        Array of time for each image frame
+    t_units: astropy.units, 
+        Time units for t_frames.
+    coords: list of arrays, 
+        For 3D emission coords=[x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
+        alpha, beta are image coordinates. These arrays contain the ray integration points
+    Omega: array, 
+        Angular velocity array sampled along the coords points
+    g: array, 
+        doppler boosting factor, 
+    dtau: array, 
+        mino time differential
+    Sigma: array, 
+    t_start_obs: astropy.Quantity, default=None
+        Start time for observations, if None t_frames[0] is assumed to be start time.
+    t_geos: array, 
+        Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
+    t_injection: float, 
+        Time of hotspot injection in M units.
+    rmin: float, 
+        The minimum radius for recovery
+    rmax: float, 
+        The maximum radius for recovery
+    dtft_mats: array,
+        An array of discrete time fourier transform matrices for each frame time
+    vis_sigma: array,
+        An array of standard deviations for each visibility measurement
+    
+    Returns
+    -------
+    loss: jnp.array,
+        An array with loss values (the size is the number of GPUs)
+    images: jnp.array
+        An array of predicted images at different times (t_frames)
+        
+    Notes
+    -----
+    Arguments for jax.pmap:
+        axis_name='batch',
+        in_axes=(0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, 0, 0), 
+        static_broadcasted_argnums=(3),
+    """
+    loss, [images] = loss_fn_eht(state.params, state.apply_fn, target, t_frames, t_units, coords, Omega, g, dtau, Sigma, 
+                                 t_start_obs, t_geos, t_injection, rmin, rmax, dtft_mats, vis_sigma)
+    return loss, images
+    
+def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames, geos, rmax, t_injection,
+                     batched_args=[], args=[], emission_true=None, vis_res=64, log_period=100, save_period=1000):
+    """
+    Run a gradient descent optimization over the network parameters (3D emission) 
+    
+    Parameters
+    ----------
+    runname: str, 
+        String used for logging and saving checkpoints.
+    hparams: dict, 
+        'num_iters': int, number of iterations, 
+        'lr_init': float, initial learning rate,
+        'lr_final': float, final learning rate, 
+        'batchsize': int, should be an integer factor of the number of GPUs used
+    predictor: flax.training.train_state.TrainState, 
+        The training state holding the network parameters and apply_fn
+    train_pstep: jax.pmap, 
+        A parallel mapping of the training function (e.g. train_step_image or train_step_eht)
+    target: array, 
+        Target to fit the model to (image pixels or eht observations depending on train_pstep)
+    t_frames: array, 
+        Array of time for each image frame with astropy.units, 
+        Time units for t_frames.
+    geos: xr.Dataset
+        A dataset specifying geodesics (ray trajectories) ending at the image plane.
+    rmax: float, 
+        The maximum radius for recovery
+    t_injection: float, 
+        Time of hotspot injection in M units.
+    batched_args: list,
+        Additional arguments taken by the training_step function which should be batched along the first dimension (e.g. Fourier matrices)
+    args: list,
+        Additional arguments taken by the training_step function
+    emission_true: array, 
+        A ground-truth array of 3D emission for evalutation metrics 
+    vis_res: int, default=64
+        Resolution (number of grid points in x,y,z) at which to visualize the contiuous 3D emission
+    log_period: int, default=100
+        TensorBoard logging every `log_period` iterations
+    save_period: int, default=1000
+        Save checkpoint every `save_period` iterations
+        
+    Returns
+    -------
+    current_state: flax.training.train_state.TrainState, 
+        The training state holding the network parameters at the end of the optimization
+    """
+    
+    
+    from tensorboardX import SummaryWriter
+    from tqdm.notebook import tqdm
+    
+    # Logging parameters
+    checkpoint_dir = '../checkpoints/{}'.format(runname)
+    logdir = '../runs/{}'.format(runname)
+    
+    # Image rendering arguments
+    t_units = t_frames.unit
+    coords = jnp.array([geos.x, geos.y, geos.z])
+    Omega = jnp.array(geos.Omega)
+    g = jnp.array(geos.g.fillna(0.0))
+    dtau = jnp.array(geos.dtau)
+    Sigma = jnp.array(geos.Sigma)
+    t_start_obs = t_frames[0]
+    t_geos = jnp.array(geos.t)
+    t_injection = t_injection
+    rmin = geos.r.min().data
+    rendering_args = [coords, Omega, g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax]
+    
+    # Grid for visualization (no interpolation is added for easy comparison)
+    if emission_true is not None:
+        vis_coords = np.array(np.meshgrid(np.linspace(emission_true.x[0], emission_true.x[-1], emission_true.shape[0]),
+                                          np.linspace(emission_true.y[0], emission_true.y[-1], emission_true.shape[1]),
+                                          np.linspace(emission_true.z[0], emission_true.z[-1], emission_true.shape[2]),
+                                          indexing='ij'))
+    else:
+        grid_1d = np.linspace(-rmax, rmax, vis_res)
+        vis_coords = np.array(np.meshgrid(grid_1d, grid_1d, grid_1d, indexing='ij'))
+
+    params = predictor.init(jax.random.PRNGKey(1), t_frames[0], t_units, coords, Omega, t_start_obs, t_geos, t_injection)['params']
+    tx = optax.adam(learning_rate=optax.polynomial_schedule(hparams['lr_init'], hparams['lr_final'], 1, hparams['num_iters']))
+    state = train_state.TrainState.create(apply_fn=predictor.apply, params=params.unfreeze(), tx=tx)  # TODO(pratul): this unfreeze feels sketchy
+
+    # Restore saved checkpoint
+    # if np.isscalar(save_period): state = checkpoints.restore_checkpoint(checkpoint_dir, state)
+    init_step = 1 + state.step
+    
+    # Replicate state for multiple gpus
+    state = flax.jax_utils.replicate(state)
+    with SummaryWriter(logdir=logdir) as writer:
+        if emission_true is not None: writer.add_images('emission/true', bhnerf.utils.intensity_to_nchw(emission_true), global_step=0)
+
+        for i in tqdm(range(init_step, init_step + hparams['num_iters']), desc='iteration'):
+            batch = np.random.choice(range(len(t_frames)), hparams['batchsize'], replace=False)
+            bargs = [shard(arg[batch, ...]) for arg in batched_args]
+            loss, state, images = train_pstep(state, shard(target[batch, ...]), shard(t_frames[batch, ...]), t_units, *rendering_args, *bargs, *args)
+
+            # Log the current state on TensorBoard
+            writer.add_scalar('log_loss/train', np.log10(np.mean(loss)), global_step=i)
+            if (i == 1) or ((i % log_period) == 0) or (i ==  init_step + hparams['num_iters']):
+                current_state = jax.device_get(flax.jax_utils.unreplicate(state))
+                emission_grid = state.apply_fn({'params': current_state.params}, t_frames[0], t_units, vis_coords, 0.0, t_start_obs, 0.0, 0.0)
+                emission_grid = bhnerf.emission.fill_unsupervised_emission(emission_grid, vis_coords, rmin, rmax)
+                writer.add_images('emission/estimate', bhnerf.utils.intensity_to_nchw(emission_grid), global_step=i)
+                if emission_true is not None:
+                    writer.add_scalar('emission/mse', bhnerf.utils.mse(emission_true.data, emission_grid), global_step=i)
+                    writer.add_scalar('emission/psnr', bhnerf.utils.psnr(emission_true.data, emission_grid), global_step=i)
+
+            # Save checkpoints occasionally
+            if np.isscalar(save_period) and ((i % save_period == 0) or (i ==  init_step + hparams['num_iters'])):
+                current_state = jax.device_get(flax.jax_utils.unreplicate(state))
+                checkpoints.save_checkpoint(checkpoint_dir, current_state, int(i), keep=5)
+    return current_state

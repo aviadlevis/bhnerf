@@ -210,3 +210,9 @@ def anti_aliasing_filter(image_plane, window):
     fourier = jnp.fft.fft2(jnp.fft.ifftshift(image_plane, axes=(-2, -1))) * jnp.fft.fft2(jnp.fft.ifftshift(window))
     image_plane = jnp.fft.ifftshift(jnp.fft.ifft2(fourier), axes=(-2, -1)).real
     return image_plane
+
+def expand_dims(x, ndim, axis=0, use_jax=False):
+    _np = jnp if use_jax else np
+    for i in range(ndim-_np.array(x).ndim):
+        x = _np.expand_dims(x, axis=axis)
+    return x

@@ -187,6 +187,18 @@ def observe_same(movie, obs, ttype='nfft', output_path='./caltable', thermal_noi
     return obs
 
 def padded_obs(obs, field, fill_value=np.nan):
+    """
+    Pad observation values to form matrices
+    
+    Parameters
+    ----------
+    obs: ehtim.Observation, 
+        eht-imaging observation object
+    field: str
+        Which field to extract: 'vis', 'sigma', 'u' etc...
+    fill_value: float, default=np.nan
+        Fill value for empty data points
+    """
     obslist = obs.tlist()
     max_num_uv = np.max([len(obsdata[field]) for obsdata in obslist])
     output = np.full((len(obslist), max_num_uv), fill_value, dtype=obslist[0][field].dtype)
