@@ -161,7 +161,8 @@ class NeRF_Predictor(nn.Module):
             
             return emission
         
-        emission = predict_emission(t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection)
+        t_injection_param = self.param('t_injection', lambda key, values: jnp.array(values, dtype=jnp.float32), t_injection)
+        emission = predict_emission(t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection_param)
         return emission
     
 def loss_fn_image(params, predictor_fn, target, t_frames, t_units, coords, Omega, 
@@ -573,7 +574,6 @@ def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames,
         The training state holding the network parameters at the end of the optimization
     """
     
-    
     from tensorboardX import SummaryWriter
     from tqdm.notebook import tqdm
     
@@ -605,7 +605,14 @@ def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames,
         vis_coords = np.array(np.meshgrid(grid_1d, grid_1d, grid_1d, indexing='ij'))
 
     params = predictor.init(jax.random.PRNGKey(1), t_frames[0], t_units, coords, Omega, t_start_obs, t_geos, t_injection)['params']
+    
     tx = optax.adam(learning_rate=optax.polynomial_schedule(hparams['lr_init'], hparams['lr_final'], 1, hparams['num_iters']))
+    if 'lr_inject' in hparams.keys():
+        tx = optax.chain(
+            optax.masked(optax.adam(learning_rate=hparams['lr_inject']), mask=flattened_traversal(lambda path, _: path[-1] == 't_injection')),
+            optax.masked(tx, mask=flattened_traversal(lambda path, _: path[-1] != 't_injection')),
+        )
+        
     state = train_state.TrainState.create(apply_fn=predictor.apply, params=params.unfreeze(), tx=tx)  # TODO(pratul): this unfreeze feels sketchy
 
     # Restore saved checkpoint
@@ -629,6 +636,7 @@ def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames,
                 emission_grid = state.apply_fn({'params': current_state.params}, t_frames[0], t_units, vis_coords, 0.0, t_start_obs, 0.0, 0.0)
                 emission_grid = bhnerf.emission.fill_unsupervised_emission(emission_grid, vis_coords, rmin, rmax)
                 writer.add_images('emission/estimate', bhnerf.utils.intensity_to_nchw(emission_grid), global_step=i)
+                if 'lr_inject' in hparams.keys(): writer.add_scalar('t_injection', float(current_state.params['t_injection']), global_step=i)
                 if emission_true is not None:
                     writer.add_scalar('emission/mse', bhnerf.utils.mse(emission_true.data, emission_grid), global_step=i)
                     writer.add_scalar('emission/psnr', bhnerf.utils.psnr(emission_true.data, emission_grid), global_step=i)
