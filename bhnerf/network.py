@@ -8,7 +8,7 @@ import functools
 import bhnerf
 from jax import jit
 import optax
-
+import os
 from flax.training import train_state
 from flax.training import checkpoints
 
@@ -272,7 +272,7 @@ def loss_fn_eht(params, predictor_fn, target, t_frames, t_units, coords, Omega,
     emission = predictor_fn({'params': params}, t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection)
     emission = bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax, use_jax=True)
     images = bhnerf.emission.radiative_trasfer(emission, g, dtau, Sigma, use_jax=True)
-    visibilities = jnp.stack([jnp.matmul(ft, image.ravel()) for ft, image in zip(dtft_mats, images)])
+    visibilities = jnp.squeeze(jnp.matmul(dtft_mats, images.reshape(images.shape[0], -1, 1)), -1)
     loss = jnp.mean((jnp.abs(visibilities - target)/vis_sigma)**2)
     return loss, [images]
 
@@ -526,7 +526,7 @@ def test_step_eht(state, target, t_frames, t_units, coords, Omega, g, dtau, Sigm
                                  t_start_obs, t_geos, t_injection, rmin, rmax, dtft_mats, vis_sigma)
     return loss, images
     
-def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames, geos, rmax, t_injection,
+def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames, geos, Omega, rmax, t_injection,
                      batched_args=[], args=[], emission_true=None, vis_res=64, log_period=100, save_period=1000):
     """
     Run a gradient descent optimization over the network parameters (3D emission) 
@@ -551,6 +551,8 @@ def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames,
         Time units for t_frames.
     geos: xr.Dataset
         A dataset specifying geodesics (ray trajectories) ending at the image plane.
+    Omega: xr.DataArray
+        A dataarray specifying the keplerian velocity field
     rmax: float, 
         The maximum radius for recovery
     t_injection: float, 
@@ -584,13 +586,12 @@ def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames,
     # Image rendering arguments
     t_units = t_frames.unit
     coords = jnp.array([geos.x, geos.y, geos.z])
-    Omega = jnp.array(geos.Omega)
-    g = jnp.array(geos.g.fillna(0.0))
+    g = jnp.array(bhnerf.emission.doppler_factor(geos, Omega))
+    Omega = jnp.array(Omega)
     dtau = jnp.array(geos.dtau)
     Sigma = jnp.array(geos.Sigma)
     t_start_obs = t_frames[0]
     t_geos = jnp.array(geos.t)
-    t_injection = t_injection
     rmin = geos.r.min().data
     rendering_args = [coords, Omega, g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax]
     
@@ -646,3 +647,95 @@ def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames,
                 current_state = jax.device_get(flax.jax_utils.unreplicate(state))
                 checkpoints.save_checkpoint(checkpoint_dir, current_state, int(i), keep=5)
     return current_state
+
+
+def total_movie_loss(runname, batchsize, predictor, test_pstep, target, t_frames, geos, rmax, 
+                     t_injection, lr_inject=True, return_frames=False, batched_args=[], args=[]):
+    """
+    This function chunks up the movie into frames which fit on GPUs and sums the total loss over all frames 
+    
+    Parameters
+    ----------
+    runname: str, 
+        String used for logging and saving checkpoints.
+    batchsize: int, 
+        Should be an integer factor of the number of GPUs used
+    predictor: flax.training.train_state.TrainState, 
+        The training state holding the network parameters and apply_fn
+    trest_pstep: jax.pmap, 
+        A parallel mapping of the testing function (e.g. test_step_image or test_step_eht)
+    target: array, 
+        Target to fit the model to (image pixels or eht observations depending on train_pstep)
+    t_frames: array, 
+        Array of time for each image frame with astropy.units, 
+        Time units for t_frames.
+    geos: xr.Dataset
+        A dataset specifying geodesics (ray trajectories) ending at the image plane.
+    rmax: float, 
+        The maximum radius for recovery
+    t_injection: float, 
+        Time of hotspot injection in M units.
+    lr_inject: bool, default=True
+        True for optimized injection time. 
+    return_frames: bool, default=False, 
+        Return the estimated movie frames
+    batched_args: list,
+        Additional arguments taken by the training_step function which should be batched along the first dimension (e.g. Fourier matrices)
+    args: list,
+        Additional arguments taken by the training_step function
+        
+    Returns
+    -------
+    total_loss: float,
+        The total loss over all frames.
+    """
+        
+    checkpoint_dir = os.path.join('../checkpoints', runname)
+    if not os.path.exists(checkpoint_dir): 
+        raise AttributeError('checkpoint directory does not exist: {}'.format(checkpoint_dir))
+        
+    # Image rendering arguments
+    t_units = t_frames.unit
+    coords = jnp.array([geos.x, geos.y, geos.z])
+    Omega = jnp.array(geos.Omega)
+    g = jnp.array(geos.g.fillna(0.0))
+    dtau = jnp.array(geos.dtau)
+    Sigma = jnp.array(geos.Sigma)
+    t_start_obs = t_frames[0]
+    t_geos = jnp.array(geos.t)
+    rmin = geos.r.min().data
+    rendering_args = [coords, Omega, g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax]
+    
+    params = predictor.init(jax.random.PRNGKey(1), t_frames[0], t_units, coords, Omega, t_start_obs, t_geos, t_injection)['params']
+    tx = optax.adam(learning_rate=optax.polynomial_schedule(1, 1, 1, 1))
+    if 'lr_inject':
+        tx = optax.chain(
+            optax.masked(optax.adam(learning_rate=0), mask=flattened_traversal(lambda path, _: path[-1] == 't_injection')),
+            optax.masked(tx, mask=flattened_traversal(lambda path, _: path[-1] != 't_injection')),
+        )
+    state = train_state.TrainState.create(apply_fn=predictor.apply, params=params.unfreeze(), tx=tx)  # TODO(pratul): this unfreeze feels sketchy
+    state = checkpoints.restore_checkpoint(checkpoint_dir, state)
+    state = flax.jax_utils.replicate(state)
+    
+    # Split times according to batchsize
+    nt = len(t_frames)
+    nt_tilde = nt - nt % batchsize
+    indices = np.array_split(np.arange(0, nt_tilde), nt_tilde/batchsize)
+    indices.append(np.arange(nt-nt % batchsize, nt))
+
+    # Aggregate loss over all t_frames
+    total_loss = 0.0
+    frames = []
+    for inds in indices:
+        if (inds.size == 0): break
+        bargs = [shard(arg[inds, ...]) for arg in batched_args]
+        loss, images = test_pstep(state, shard(target[inds, ...]), shard(t_frames[inds, ...]), t_units, *rendering_args, *bargs, *args)
+        total_loss += float((batchsize // jax.device_count()) * loss.sum())
+        if return_frames:
+            frames.append(images.reshape(-1, geos.alpha.size, geos.beta.size))
+            
+    output = total_loss
+    if return_frames:
+        output = (total_loss, np.concatenate(frames))
+        
+    return output

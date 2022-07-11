@@ -103,33 +103,103 @@ def kerr_geodesics(spin, inclination, alpha_range, beta_range, ngeo=100,
     geos = raytrace_ana(spin, observer_coords, image_coords, ngeo, plotdata=False, verbose=verbose)
     geos = geos.get_dataset(num_alpha, num_beta)
 
-    pm = 1.0
-    Delta = geos.r**2 + geos.spin**2 - 2*M*geos.r
-    Sigma = geos.r**2 + geos.spin**2*np.cos(geos.theta)**2
-    A = (geos.r**2 + geos.spin**2)**2 - geos.spin**2*Delta*np.sin(geos.theta)**2
+    Delta = geos.r**2 + spin**2 - 2*M*geos.r
+    Sigma = geos.r**2 + spin**2*np.cos(geos.theta)**2
+    Xi = (geos.r**2 + spin**2)**2 - spin**2*Delta*np.sin(geos.theta)**2
 
     lam = -geos.alpha * np.sin(geos.inc)
-    eta = (geos.alpha**2 - geos.spin**2) * np.cos(geos.inc)**2 + geos.beta**2
-    R = (geos.r**2 + geos.spin**2 - geos.spin*lam)**2 - Delta * (eta + (lam - geos.spin)**2)
+    eta = (geos.alpha**2 - spin**2) * np.cos(geos.inc)**2 + geos.beta**2
+    R = (geos.r**2 + spin**2 - spin*lam)**2 - Delta * (eta + (lam - spin)**2)
 
     # Clip small values
     R = R.where(np.abs(R) > 1e-10).fillna(0.0)
-    Theta = eta + geos.spin**2*np.cos(geos.theta)**2 - lam**2 / np.tan(geos.theta)**2
+    Theta = eta + spin**2*np.cos(geos.theta)**2 - lam**2 / np.tan(geos.theta)**2
+    dtau = xr.concat((xr.DataArray(0), geos.mino.diff('geo')), dim='geo')
 
-    # Photon 4-vector momentum 
-    k_t  = -E
-    k_r  = pm * E * np.sqrt(R) / Delta
-    k_th = pm * E * np.sqrt(Theta)
-    k_ph = E * lam
-    
-    dtau = xr.concat((xr.zeros_like(geos.mino.isel(geo=0)), geos.mino.diff('geo')), dim='geo')
-    
-    geos = geos.assign(k_t=k_t, k_r=k_r, k_th=k_th, k_ph=k_ph, dtau=dtau, Sigma=Sigma, Delta=Delta, A=A, M=M, E=E)
+    geos = geos.assign(dtau=dtau, Sigma=Sigma, Delta=Delta, Xi=Xi, M=M, E=E, lam=lam, eta=eta, R=R, Theta=Theta)
     return geos
 
-def compute_keplerian_velocity(geos, Omega):
+def wave_vector(geos): 
     """
-    Compute Keplerian velocity 4-vector on points sampled along Kerr geodesics
+    Compute the wave (photon momentum)  `k`
+    
+    Parameters
+    ----------
+    geos: xr.Dataset, 
+        A dataset with the geodesic information and auxilary variables 
+    
+    Returns
+    -------
+    k_mu: xr.DataArray
+        A dataArray with the wave 4-vector 
+    """
+    # TODO: figure out where this plus-minus sign is negative
+    pm = 1.0
+    k_t  = -geos.E
+    k_r  = pm * geos.E * np.sqrt(geos.R) / geos.Delta
+    k_th = pm * geos.E * np.sqrt(geos.Theta)
+    k_ph = geos.E * geos.lam
+    k_mu = xr.concat([k_t, k_r, k_th, k_ph], dim='mu')
+    return k_mu
+    
+def spacetime_metric(geos):
+    """
+    Spacetime metric g_{munu} (Boyer-Linquist coordinates)
+    
+    Parameters
+    ----------
+    geos: xr.Dataset, 
+        A dataset with the geodesic information and auxilary variables 
+    
+    Returns
+    -------
+    g_munu: xr.Dataset
+        A dataset with the spacetime metric (non-zero components) 
+        
+    Notes
+    -----
+    g_munu is symetric (g_munu = g_numu) 
+    """
+    g_munu = xr.Dataset({
+        'g_tt': -(1 - 2*geos.M*geos.r / geos.Sigma), 
+        'g_rr': geos.Sigma / geos.Delta,
+        'g_thth': geos.Sigma,
+        'g_phph': geos.Xi*np.sin(geos.theta)**2 / geos.Sigma, 
+        'g_tph': 2*geos.M*geos.spin*geos.r*np.sin(geos.theta)**2 / geos.Sigma
+    })
+    return g_munu
+
+def spacetime_inv_metric(geos):
+    """
+    Inverse spacetime metric g^{munu} (Boyer-Linquist coordinates)
+    
+    Parameters
+    ----------
+    geos: xr.Dataset, 
+        A dataset with the geodesic information and auxilary variables 
+    
+    Returns
+    -------
+    gmunu: xr.Dataset
+        A dataset with the *inverse* spacetime metric (non-zero components) 
+        
+    Notes
+    -----
+    gmunu is symetric (gmunu = gnumu) 
+    """
+    gmunu = xr.Dataset({
+        'gtt': -geos.Xi / (geos.Delta * geos.Sigma),
+        'grr': geos.Delta / geos.Sigma,
+        'gthth': 1 / geos.Sigma,
+        'gphph': (geos.Delta - geos.spin**2 * np.sin(geos.theta)**2) / 
+                 (geos.Delta * geos.Sigma * np.sin(geos.theta)**2), 
+        'gtph': -2*geos.M*geos.spin*geos.r / (geos.Delta * geos.Sigma)
+    })
+    return gmunu
+
+def azimuthal_velocity_vector(geos, Omega):
+    """
+    Compute azimuthal velocity umu 4-vector on points sampled along geodesics
     
     Parameters
     ----------
@@ -140,36 +210,44 @@ def compute_keplerian_velocity(geos, Omega):
     
     Returns
     -------
-    geos: xr.Dataset
-        updated geos Dataset with:
-        1. Orbit velocity components: (ut, ur, uth, uph)
-        2. Doppler boosting component: g
-        
-    Notes
-    -----
-    Overleaf notes: https://www.overleaf.com/project/60ff0ece5aa4f90d07f2a417
+    umu: xr.DataArray
+        array with contravarient velocity 4 vector (index up) 
     """
-    # omega = 2*geos.spin*geos.M*geos.r / geos.A
-    # V = geos.A / (geos.Sigma * np.sqrt(geos.Delta)) * (Omega - omega)
-    # ut = np.sqrt(geos.A / (geos.Delta * geos.Sigma)) / np.sqrt(1-V**2)
-    
-    # Spacetime metric (Boyer-Linquist coordinates)
-    g_tt = -(1 - 2*geos.M*geos.r / geos.Sigma)
-    g_phph = geos.A*np.sin(geos.theta)**2 / geos.Sigma
-    g_tphi = 2*geos.M*geos.spin*geos.r*np.sin(geos.theta)**2 / geos.Sigma
+    g_munu = spacetime_metric(geos)
     
     # 4-velocity vector
-    ut = 1 / np.sqrt(-(g_tt + 2*Omega*g_tphi + g_phph*Omega**2))
-    ur = 0.0
-    uth = 0.0
+    ut = 1 / np.sqrt(-(g_munu.g_tt + 2*Omega*g_munu.g_tph + g_munu.g_phph*Omega**2))
+    ur = xr.DataArray(0)
+    uth = xr.DataArray(0)
     uph = ut * Omega
+    umu = xr.concat([ut, ur, uth, uph], dim='mu', coords='minimal')
+    return umu
 
-    # Compute Doppler factor as dot product of photon/emission momentum 4-vectors
-    g = geos.E / -(geos.k_t*ut + geos.k_r*ur + geos.k_th*uth + geos.k_ph*uph)
-    g = g.fillna(0.0)
+def doppler_factor(geos, Omega, fillna=0.0):
+    """
+    Compute Doppler factor as dot product of wave 4-vectors with the velocity 4-vecotr
     
-    geos = geos.assign(g_tt=g_tt, g_phph=g_phph, g_tphi=g_tphi, ut=ut, ur=ur, uth=uth, uph=uph, g=g, Omega=Omega)
-    return geos
+    Parameters
+    ----------
+    geos: xr.Dataset
+        Dataset with Kerr geodesics (see: `kerr_geodesics` for more details)
+    Omega: array, 
+        An array with angular velocity specified along the geodesics coordinates
+    fillna: float or False or None, 
+        If float fill nans with float else if False leave nans
+        
+    Returns
+    -------
+    g: xr.DataArray,
+        Doppler boosting factor sampled along the geodesics
+    """
+    g_munu = spacetime_metric(geos)
+    k_mu = wave_vector(geos)
+    umu = azimuthal_velocity_vector(geos, Omega)
+    g = geos.E / -(k_mu * umu).sum('mu', skipna=False)
+    if not ((isinstance(fillna, bool) and fillna == False) or fillna is None):
+        g = g.fillna(fillna)
+    return g
 
 def velocity_warp_coords(coords, Omega, t_frames, t_start_obs, t_geos, t_injection, rot_axis=[0,0,1], M=consts.sgra_mass, t_units=None, use_jax=False):
     """
@@ -290,7 +368,7 @@ def radiative_trasfer(emission, g, dtau, Sigma, use_jax=False):
     fluxes = (g**2 * emission * dtau * Sigma).sum(axis=-1)
     return fluxes
 
-def image_plane_dynamics(emission_0, geos, t_frames, t_injection, t_start_obs=None, rot_axis=[0,0,1], M=consts.sgra_mass):
+def image_plane_dynamics(emission_0, geos, Omega, t_frames, t_injection, t_start_obs=None, rot_axis=[0,0,1], M=consts.sgra_mass):
     """
     Compute the image-plane dynamics (movie) for a given initial emission and geodesics.
     
@@ -300,6 +378,8 @@ def image_plane_dynamics(emission_0, geos, t_frames, t_injection, t_start_obs=No
         3D array with emission values
     geos: xr.Dataset
         A dataset specifying geodesics (ray trajectories) ending at the image plane.
+    Omega: xr.DataArray
+        A dataarray specifying the keplerian velocity field
     t_frames: array, 
         Array of time for each image frame with astropy.units
     t_injection: float, 
@@ -318,7 +398,7 @@ def image_plane_dynamics(emission_0, geos, t_frames, t_injection, t_start_obs=No
     """
     warped_coords = velocity_warp_coords(
         coords=[geos.x, geos.y, geos.z],
-        Omega=geos.Omega, 
+        Omega=Omega, 
         t_frames=t_frames, 
         t_start_obs=t_frames[0] if t_start_obs is None else t_start_obs, 
         t_geos=geos.t, 
@@ -327,7 +407,8 @@ def image_plane_dynamics(emission_0, geos, t_frames, t_injection, t_start_obs=No
         M=M  
     )
     emission = interpolate_coords(emission_0, warped_coords)
-    movie = radiative_trasfer(emission, np.array(geos.g), np.array(geos.dtau), np.array(geos.Sigma))
+    g = doppler_factor(geos, Omega)
+    movie = radiative_trasfer(emission, np.array(g), np.array(geos.dtau), np.array(geos.Sigma))
     return movie
 
 def fill_unsupervised_emission(emission, coords, rmin=0, rmax=np.Inf, fill_value=0.0, use_jax=False):
