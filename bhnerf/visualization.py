@@ -61,28 +61,48 @@ def slider_frame_comparison(frames1, frames2, scale='amp'):
     interact(imshow_frame, frame=(0, num_frames-1));
     
 def plot_geodesic_3D(data_array, geos, method='interact', max_r=10, figsize=(5,5), init_alpha=0, 
-                     init_beta=0, vmin=None, vmax=None, cbar_shrink=0.65, fps=10, horizon=True, isco=False):
+                     init_beta=0, vmin=None, vmax=None, cbar_shrink=0.65, fps=10, horizon=True, wire_sphere_r=None):
     
     from mpl_toolkits.mplot3d.art3d import Line3DCollection
     from mpl_toolkits.mplot3d import Axes3D
     import ipywidgets as widgets
     
-    def update(ialpha, ibeta, vmin, vmax):
-        trajectory = geos.isel(alpha=ialpha, beta=ibeta)
-        values = data_array.isel(alpha=ialpha, beta=ibeta)
-        trajectory = trajectory.where(trajectory.r < 2*max_r)
-        x, y, z = trajectory.x.data, trajectory.y.data, trajectory.z.data
-        points = np.array([x, y, z]).T.reshape(-1, 1, 3)
-        segments = np.concatenate([points[:-1], points[1:]], axis=1)
-        lc.set_segments(segments)
-        lc.set_array(values)
-        if vmin is None:
-            vmin = values.min()
-        if vmax is None:
-            vmax = values.max()
-        lc.set_clim([vmin, vmax])
-        ax.set_title('alpha={}, beta={}'.format(values.alpha, values.beta))
-        return lc,
+    if ('alpha' in geos.dims) and ('beta' in geos.dims):
+        def update(ialpha, ibeta, vmin, vmax):
+            trajectory = geos.isel(alpha=ialpha, beta=ibeta)
+            values = data_array.isel(alpha=ialpha, beta=ibeta)
+            trajectory = trajectory.where(trajectory.r < 2*max_r)
+            x, y, z = trajectory.x.data, trajectory.y.data, trajectory.z.data
+            points = np.array([x, y, z]).T.reshape(-1, 1, 3)
+            segments = np.concatenate([points[:-1], points[1:]], axis=1)
+            lc.set_segments(segments)
+            lc.set_array(values)
+            if vmin is None:
+                vmin = values.min()
+            if vmax is None:
+                vmax = values.max()
+            lc.set_clim([vmin, vmax])
+            ax.set_title('alpha={}, beta={}'.format(values.alpha, values.beta))
+            return lc,
+    elif ('pix' in geos.dims):
+        def update(pix, vmin, vmax):
+            trajectory = geos.isel(pix=pix)
+            values = data_array.isel(pix=pix)
+            trajectory = trajectory.where(trajectory.r < 2*max_r)
+            x, y, z = trajectory.x.data, trajectory.y.data, trajectory.z.data
+            points = np.array([x, y, z]).T.reshape(-1, 1, 3)
+            segments = np.concatenate([points[:-1], points[1:]], axis=1)
+            lc.set_segments(segments)
+            lc.set_array(values)
+            if vmin is None:
+                vmin = values.min()
+            if vmax is None:
+                vmax = values.max()
+            lc.set_clim([vmin, vmax])
+            ax.set_title('alpha={}, beta={}'.format(values.alpha, values.beta))
+            return lc,
+    else: 
+        raise AttributeError
         
     if method not in ['interact', 'static', 'animate']:
         raise AttributeError('undefined method: {}'.format(method))
@@ -104,14 +124,16 @@ def plot_geodesic_3D(data_array, geos, method='interact', max_r=10, figsize=(5,5
         ax.plot_surface(r_plus*x, r_plus*y, r_plus*z, linewidth=0.0, color='black')
 
     # Plot the ISCO as a wire-frame
-    if isco:
-        from bhnerf import constants
-        r_isco = float(constants.isco_pro(geos.spin))
-        ax.plot_wireframe(r_isco*x, r_isco*y, r_isco*z, rcount=10, ccount=10, linewidth=0.3)
+    if wire_sphere_r is not None:
+        ax.plot_wireframe(wire_sphere_r*x, wire_sphere_r*y, wire_sphere_r*z, rcount=10, ccount=10, linewidth=0.3)
     
-
-    trajectory = geos.isel(alpha=init_alpha, beta=init_beta)
-    values = data_array.isel(alpha=init_alpha, beta=init_beta)
+    if ('alpha' in geos.dims) and ('beta' in geos.dims):
+        trajectory = geos.isel(alpha=init_alpha, beta=init_beta)
+        values = data_array.isel(alpha=init_alpha, beta=init_beta)
+    elif ('pix' in geos.dims):
+        trajectory = geos.isel(pix=0)
+        values = data_array.isel(pix=0)
+        
     trajectory = trajectory.where(trajectory.r < 2*max_r)
     x, y, z = trajectory.x.data, trajectory.y.data, trajectory.z.data
 
@@ -128,8 +150,11 @@ def plot_geodesic_3D(data_array, geos, method='interact', max_r=10, figsize=(5,5
 
     output = fig
     if method == 'interact':
-        widgets.interact(update, ialpha=(0, geos.alpha.size-1), ibeta=(0, geos.beta.size-1),
-                         vmin=widgets.fixed(vmin), vmax=widgets.fixed(vmax)) 
+        if ('alpha' in geos.dims) and ('beta' in geos.dims):
+            widgets.interact(update, ialpha=(0, geos.alpha.size-1), ibeta=(0, geos.beta.size-1),
+                             vmin=widgets.fixed(vmin), vmax=widgets.fixed(vmax))
+        elif ('pix' in geos.dims):
+            widgets.interact(update, pix=(0, geos.pix.size-1), vmin=widgets.fixed(vmin), vmax=widgets.fixed(vmax))
     if method == 'animate':
         raise NotImplementedError
         # output = animation.FuncAnimation(fig, lambda pix: update(pix, vmin, vmax), 

@@ -165,8 +165,8 @@ class NeRF_Predictor(nn.Module):
         emission = predict_emission(t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection_param)
         return emission
     
-def loss_fn_image(params, predictor_fn, target, t_frames, t_units, coords, Omega, 
-                  g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax):
+def loss_fn_image(params, predictor_fn, target, t_frames, coords, Omega, 
+                  g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, t_units):
     """
     An L2 loss function for image pixels
 
@@ -216,8 +216,8 @@ def loss_fn_image(params, predictor_fn, target, t_frames, t_units, coords, Omega
     loss = jnp.mean(jnp.abs(images - target)**2)
     return loss, [images]
 
-def loss_fn_eht(params, predictor_fn, target, t_frames, t_units, coords, Omega, 
-                g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, dtft_mats, vis_sigma):
+def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega, 
+                g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, t_units):
     """
     An chi-square loss function for EHT observations
 
@@ -272,12 +272,12 @@ def loss_fn_eht(params, predictor_fn, target, t_frames, t_units, coords, Omega,
     emission = predictor_fn({'params': params}, t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection)
     emission = bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax, use_jax=True)
     images = bhnerf.emission.radiative_trasfer(emission, g, dtau, Sigma, use_jax=True)
-    visibilities = jnp.squeeze(jnp.matmul(dtft_mats, images.reshape(images.shape[0], -1, 1)), -1)
-    loss = jnp.mean((jnp.abs(visibilities - target)/vis_sigma)**2)
+    visibilities = jnp.squeeze(jnp.matmul(A, images.reshape(images.shape[0], -1, 1)), -1)
+    loss = jnp.mean((jnp.abs(visibilities - target)/sigma)**2)
     return loss, [images]
 
-@functools.partial(jit, static_argnums=(3))
-def train_step_image(state, target, t_frames, t_units, coords, Omega, g, dtau, Sigma,
+@functools.partial(jit, static_argnums=(1))
+def train_step_image(state, t_units, target, t_frames, coords, Omega, g, dtau, Sigma,
                      t_start_obs, t_geos, t_injection, rmin, rmax):
     """
     Training step function for fitting the image-plane directly
@@ -332,14 +332,14 @@ def train_step_image(state, target, t_frames, t_units, coords, Omega, g, dtau, S
         static_broadcasted_argnums=(3),
     """
     (loss, [images]), grads = jax.value_and_grad(loss_fn_image, argnums=(0), has_aux=True)(
-        state.params, state.apply_fn, target, t_frames, t_units, coords, Omega, g, dtau, Sigma, 
-        t_start_obs, t_geos, t_injection, rmin, rmax)
+        state.params, state.apply_fn, target, t_frames, coords, Omega, g, dtau, Sigma, 
+        t_start_obs, t_geos, t_injection, rmin, rmax, t_units)
     grads = jax.lax.pmean(grads, axis_name='batch')
     state = state.apply_gradients(grads=grads)
     return loss, state, images
 
-@functools.partial(jit, static_argnums=(3))
-def test_step_image(state, target, t_frames, t_units, coords, Omega, g, dtau, Sigma, 
+@functools.partial(jit, static_argnums=(1))
+def test_step_image(state, t_units, target, t_frames, coords, Omega, g, dtau, Sigma, 
                     t_start_obs, t_geos, t_injection, rmin, rmax):
     """
     Test step function for fitting the image-plane directly. 
@@ -396,13 +396,13 @@ def test_step_image(state, target, t_frames, t_units, coords, Omega, g, dtau, Si
         static_broadcasted_argnums=(3),
     """
     loss, [images] = loss_fn_image(
-        state.params, state.apply_fn, target, t_frames, t_units, coords, Omega, g, dtau, Sigma, 
-        t_start_obs, t_geos, t_injection, rmin, rmax)
+        state.params, state.apply_fn, target, t_frames, coords, Omega, g, dtau, Sigma, 
+        t_start_obs, t_geos, t_injection, rmin, rmax, t_units)
     return loss, images
 
-@functools.partial(jit, static_argnums=(3))
-def train_step_eht(state, target, t_frames, t_units, coords, Omega, g, dtau, Sigma, t_start_obs, 
-                   t_geos, t_injection, rmin, rmax, dtft_mats, vis_sigma):
+@functools.partial(jit, static_argnums=(1))
+def train_step_eht(state, t_units, target, sigma, A, t_frames, coords, Omega, g, dtau, Sigma, t_start_obs, 
+                   t_geos, t_injection, rmin, rmax):
     """
     Train step function for fitting eht observations
     This function computed gradients and updates the state. 
@@ -458,16 +458,15 @@ def train_step_eht(state, target, t_frames, t_units, coords, Omega, g, dtau, Sig
         static_broadcasted_argnums=(3),
     """
     (loss, [images]), grads = jax.value_and_grad(loss_fn_eht, argnums=(0), has_aux=True)(
-        state.params, state.apply_fn, target, t_frames, t_units, coords, Omega, g, dtau, Sigma, 
-        t_start_obs, t_geos, t_injection, rmin, rmax, dtft_mats, vis_sigma)
+        state.params, state.apply_fn, target, sigma, A, t_frames, coords, Omega, g, dtau, Sigma, 
+        t_start_obs, t_geos, t_injection, rmin, rmax, t_units)
     grads = jax.lax.pmean(grads, axis_name='batch')
     state = state.apply_gradients(grads=grads)
     return loss, state, images
 
-
-@functools.partial(jit, static_argnums=(3))
-def test_step_eht(state, target, t_frames, t_units, coords, Omega, g, dtau, Sigma, 
-                  t_start_obs, t_geos, t_injection, rmin, rmax, dtft_mats, vis_sigma):
+@functools.partial(jit, static_argnums=(1))
+def test_step_eht(state, t_units, target, sigma, A, t_frames, coords, Omega, g, dtau, Sigma, 
+                  t_start_obs, t_geos, t_injection, rmin, rmax):
     """
     Test step function for fitting eht observations
     This function is identical to train_step_image except does not compute gradients or 
@@ -522,12 +521,12 @@ def test_step_eht(state, target, t_frames, t_units, coords, Omega, g, dtau, Sigm
         in_axes=(0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, 0, 0), 
         static_broadcasted_argnums=(3),
     """
-    loss, [images] = loss_fn_eht(state.params, state.apply_fn, target, t_frames, t_units, coords, Omega, g, dtau, Sigma, 
-                                 t_start_obs, t_geos, t_injection, rmin, rmax, dtft_mats, vis_sigma)
+    loss, [images] = loss_fn_eht(state.params, state.apply_fn, target, sigma, A, t_frames, coords, Omega, g, dtau, Sigma, 
+                                 t_start_obs, t_geos, t_injection, rmin, rmax, t_units)
     return loss, images
     
 def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames, geos, Omega, rmax, t_injection,
-                     batched_args=[], args=[], emission_true=None, vis_res=64, log_period=100, save_period=1000):
+                     batched_args=[], emission_true=None, vis_res=64, log_period=100, save_period=1000):
     """
     Run a gradient descent optimization over the network parameters (3D emission) 
     
@@ -586,7 +585,8 @@ def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames,
     # Image rendering arguments
     t_units = t_frames.unit
     coords = jnp.array([geos.x, geos.y, geos.z])
-    g = jnp.array(bhnerf.emission.doppler_factor(geos, Omega))
+    umu = bhnerf.emission.azimuthal_velocity_vector(geos, Omega)
+    g = jnp.array(bhnerf.emission.doppler_factor(geos, umu))
     Omega = jnp.array(Omega)
     dtau = jnp.array(geos.dtau)
     Sigma = jnp.array(geos.Sigma)
@@ -628,7 +628,7 @@ def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames,
         for i in tqdm(range(init_step, init_step + hparams['num_iters']), desc='iteration'):
             batch = np.random.choice(range(len(t_frames)), hparams['batchsize'], replace=False)
             bargs = [shard(arg[batch, ...]) for arg in batched_args]
-            loss, state, images = train_pstep(state, shard(target[batch, ...]), shard(t_frames[batch, ...]), t_units, *rendering_args, *bargs, *args)
+            loss, state, images = train_pstep(state, t_units, *bargs, *rendering_args)
 
             # Log the current state on TensorBoard
             writer.add_scalar('log_loss/train', np.log10(np.mean(loss)), global_step=i)
