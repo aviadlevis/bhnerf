@@ -217,7 +217,7 @@ def loss_fn_image(params, predictor_fn, target, t_frames, coords, Omega,
     return loss, [images]
 
 def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega, 
-                g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, t_units):
+                g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, t_units, dtype):
     """
     An chi-square loss function for EHT observations
 
@@ -257,6 +257,8 @@ def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega,
         The maximum radius for recovery
     t_units: astropy.units, 
         Time units for t_frames.
+    dtype: 'str',
+        Datatype to compute the loss for ('vis'/'cphase' etc..)
         
     Returns
     -------
@@ -272,9 +274,21 @@ def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega,
     emission = predictor_fn({'params': params}, t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection)
     emission = bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax, use_jax=True)
     images = bhnerf.emission.radiative_trasfer(emission, g, dtau, Sigma, use_jax=True)
-    visibilities = jnp.squeeze(jnp.matmul(A, images.reshape(images.shape[0], -1, 1)), -1)
-    loss = jnp.mean((jnp.abs(visibilities - target)/sigma)**2)
-    return loss, [images]
+    
+    # Reshape images to match A operations
+    image_vectors = images.reshape(images.shape[0], -1, 1)
+    image_vectors = bhnerf.utils.expand_dims(image_vectors, A.ndim, axis=1, use_jax=True)
+    visibilities = jnp.squeeze(jnp.matmul(A, image_vectors), -1)
+    
+    if dtype == 'vis':
+        if A.ndim != 3: raise AttributeError('A matrix should have 3 dimensions for cphase dtype')
+        chisq = jnp.mean((jnp.abs(visibilities - target)/sigma)**2)
+    elif dtype == 'cphase':
+        if A.ndim != 4: raise AttributeError('A matrix should have 4 dimensions for cphase dtype')
+        clphase_samples = jnp.angle(jnp.product(visibilities, axis=1))
+        chisq = jnp.mean((1.0 - jnp.cos(target-clphase_samples))/(sigma**2))
+        
+    return chisq, [images]
 
 @functools.partial(jit, static_argnums=(1))
 def train_step_image(state, t_units, target, t_frames, coords, Omega, g, dtau, Sigma,
@@ -392,8 +406,8 @@ def test_step_image(state, t_units, target, t_frames, coords, Omega, g, dtau, Si
         t_start_obs, t_geos, t_injection, rmin, rmax, t_units)
     return loss, images
 
-@functools.partial(jit, static_argnums=(1))
-def train_step_eht(state, t_units, target, sigma, A, t_frames, coords, Omega, g, dtau, Sigma, t_start_obs, 
+@functools.partial(jit, static_argnums=(1, 2))
+def train_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, g, dtau, Sigma, t_start_obs, 
                    t_geos, t_injection, rmin, rmax):
     """
     Train step function for fitting eht observations
@@ -406,6 +420,8 @@ def train_step_eht(state, t_units, target, sigma, A, t_frames, coords, Omega, g,
         The training state holding the network parameters and apply_fn
     t_units: astropy.units, 
         Time units for t_frames.
+    dtype: 'str',
+        Datatype to compute the loss for ('vis'/'cphase' etc..)
     target: array, 
         Target measurement values to fit the model to. 
     A: array,
@@ -414,6 +430,8 @@ def train_step_eht(state, t_units, target, sigma, A, t_frames, coords, Omega, g,
         An array of standard deviations for each measurement
     t_frames: array, 
         Array of time for each image frame
+    dtype: 'str', default='vis'
+        Datatype to compute the loss for ('vis'/'cphase' etc..)
     coords: list of arrays, 
         For 3D emission coords=[x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
         alpha, beta are image coordinates. These arrays contain the ray integration points
@@ -434,7 +452,7 @@ def train_step_eht(state, t_units, target, sigma, A, t_frames, coords, Omega, g,
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
-
+        
     Returns
     -------
     loss: jnp.array,
@@ -446,18 +464,18 @@ def train_step_eht(state, t_units, target, sigma, A, t_frames, coords, Omega, g,
     -----
     Arguments for jax.pmap:
         axis_name='batch',
-        in_axes=(0, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None),
-        static_broadcasted_argnums=(1),
+        in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None), 
+        static_broadcasted_argnums=(1, 2))
     """
     (loss, [images]), grads = jax.value_and_grad(loss_fn_eht, argnums=(0), has_aux=True)(
         state.params, state.apply_fn, target, sigma, A, t_frames, coords, Omega, g, dtau, Sigma, 
-        t_start_obs, t_geos, t_injection, rmin, rmax, t_units)
+        t_start_obs, t_geos, t_injection, rmin, rmax, t_units, dtype)
     grads = jax.lax.pmean(grads, axis_name='batch')
     state = state.apply_gradients(grads=grads)
     return loss, state, images
 
-@functools.partial(jit, static_argnums=(1))
-def test_step_eht(state, t_units, target, sigma, A, t_frames, coords, Omega, g, dtau, Sigma, 
+@functools.partial(jit, static_argnums=(1, 2))
+def test_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, g, dtau, Sigma, 
                   t_start_obs, t_geos, t_injection, rmin, rmax):
     """
     Test step function for fitting eht observations
@@ -470,6 +488,8 @@ def test_step_eht(state, t_units, target, sigma, A, t_frames, coords, Omega, g, 
         The training state holding the network parameters and apply_fn
     t_units: astropy.units, 
         Time units for t_frames.
+    dtype: 'str',
+        Datatype to compute the loss for ('vis'/'cphase' etc..)
     target: array, 
         Target measurement values to fit the model to. 
     A: array,
@@ -498,7 +518,7 @@ def test_step_eht(state, t_units, target, sigma, A, t_frames, coords, Omega, g, 
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
-
+        
     Returns
     -------
     loss: jnp.array,
@@ -510,15 +530,15 @@ def test_step_eht(state, t_units, target, sigma, A, t_frames, coords, Omega, g, 
     -----
     Arguments for jax.pmap:
         axis_name='batch',
-        in_axes=(0, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None),
-        static_broadcasted_argnums=(1),
+        in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None), 
+        static_broadcasted_argnums=(1, 2))
     """
     loss, [images] = loss_fn_eht(state.params, state.apply_fn, target, sigma, A, t_frames, coords, Omega, g, dtau, Sigma, 
-                                 t_start_obs, t_geos, t_injection, rmin, rmax, t_units)
+                                 t_start_obs, t_geos, t_injection, rmin, rmax, t_units, dtype)
     return loss, images
     
 def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames, geos, Omega, rmax, t_injection,
-                     batched_args=[], emission_true=None, vis_res=64, log_period=100, save_period=1000):
+                     batched_args=[], non_jit_args=[], emission_true=None, vis_res=64, log_period=100, save_period=1000):
     """
     Run a gradient descent optimization over the network parameters (3D emission) 
     
@@ -548,6 +568,8 @@ def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames,
         The maximum radius for recovery
     t_injection: float, 
         Time of hotspot injection in M units.
+    non_jit_args: list,
+        Arguments that are not jitted (should appear in static_broadcasted_argnums)
     batched_args: list,
         Arguments taken by the training_step function which should be batched along the first dimension (e.g. Fourier matrices)
     emission_true: array, 
@@ -574,6 +596,7 @@ def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames,
     
     # Image rendering arguments
     t_units = t_frames.unit
+    non_jit_args = [t_units] + non_jit_args
     coords = jnp.array([geos.x, geos.y, geos.z])
     umu = bhnerf.emission.azimuthal_velocity_vector(geos, Omega)
     g = jnp.array(bhnerf.emission.doppler_factor(geos, umu))
@@ -618,7 +641,7 @@ def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames,
         for i in tqdm(range(init_step, init_step + hparams['num_iters']), desc='iteration'):
             batch = np.random.choice(range(len(t_frames)), hparams['batchsize'], replace=False)
             bargs = [shard(arg[batch, ...]) for arg in batched_args]
-            loss, state, images = train_pstep(state, t_units, *bargs, *rendering_args)
+            loss, state, images = train_pstep(state, *non_jit_args, *bargs, *rendering_args)
 
             # Log the current state on TensorBoard
             writer.add_scalar('log_loss/train', np.log10(np.mean(loss)), global_step=i)
