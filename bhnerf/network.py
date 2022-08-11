@@ -180,8 +180,6 @@ def loss_fn_image(params, predictor_fn, target, t_frames, coords, Omega,
         Target images to fit the model to. 
     t_frames: array, 
         Array of time for each image frame
-    t_units: astropy.units, 
-        Time units for t_frames.
     coords: list of arrays, 
         For 3D emission coords=[x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
         alpha, beta are image coordinates. These arrays contain the ray integration points
@@ -202,6 +200,8 @@ def loss_fn_image(params, predictor_fn, target, t_frames, coords, Omega,
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
+    t_units: astropy.units, 
+        Time units for t_frames.
         
     Returns
     -------
@@ -228,11 +228,13 @@ def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega,
     predictor_fn: nn.Module
         A coordinate-based neural net for predicting the emission values as a continuous function
     target: array, 
-        Target images to fit the model to. 
+        Target measurement values to fit the model to. 
+    A: array,
+        An array of discrete time fourier transform matrices for each frame time
+    sigma: array,
+        An array of standard deviations for each measurement
     t_frames: array, 
         Array of time for each image frame
-    t_units: astropy.units, 
-        Time units for t_frames.
     coords: list of arrays, 
         For 3D emission coords=[x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
         alpha, beta are image coordinates. These arrays contain the ray integration points
@@ -253,11 +255,9 @@ def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega,
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
-    dtft_mats: array,
-        An array of discrete time fourier transform matrices for each frame time
-    vis_sigma: array,
-        An array of standard deviations for each visibility measurement
-    
+    t_units: astropy.units, 
+        Time units for t_frames.
+        
     Returns
     -------
     loss: jnp.array,
@@ -286,12 +286,12 @@ def train_step_image(state, t_units, target, t_frames, coords, Omega, g, dtau, S
     ----------
     state: flax.training.train_state.TrainState, 
         The training state holding the network parameters and apply_fn
+    t_units: astropy.units, 
+        Time units for t_frames.
     target: array, 
         Target images to fit the model to. 
     t_frames: array, 
         Array of time for each image frame
-    t_units: astropy.units, 
-        Time units for t_frames.
     coords: list of arrays, 
         For 3D emission coords=[x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
         alpha, beta are image coordinates. These arrays contain the ray integration points
@@ -312,11 +312,7 @@ def train_step_image(state, t_units, target, t_frames, coords, Omega, g, dtau, S
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
-    dtft_mats: array,
-        An array of discrete time fourier transform matrices for each frame time
-    vis_sigma: array,
-        An array of standard deviations for each visibility measurement
-    
+
     Returns
     -------
     loss: jnp.array,
@@ -328,8 +324,8 @@ def train_step_image(state, t_units, target, t_frames, coords, Omega, g, dtau, S
     -----
     Arguments for jax.pmap:
         axis_name='batch',
-        in_axes=(0, 0, 0, None, None, None, None, None, None, None, None, None, None, None)
-        static_broadcasted_argnums=(3),
+        in_axes=(0, None, 0, 0, None, None, None, None, None, None, None, None, None, None),
+        static_broadcasted_argnums=(1),
     """
     (loss, [images]), grads = jax.value_and_grad(loss_fn_image, argnums=(0), has_aux=True)(
         state.params, state.apply_fn, target, t_frames, coords, Omega, g, dtau, Sigma, 
@@ -350,12 +346,12 @@ def test_step_image(state, t_units, target, t_frames, coords, Omega, g, dtau, Si
     ----------
     state: flax.training.train_state.TrainState, 
         The training state holding the network parameters and apply_fn
+    t_units: astropy.units, 
+        Time units for t_frames.
     target: array, 
         Target images to fit the model to. 
     t_frames: array, 
         Array of time for each image frame
-    t_units: astropy.units, 
-        Time units for t_frames.
     coords: list of arrays, 
         For 3D emission coords=[x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
         alpha, beta are image coordinates. These arrays contain the ray integration points
@@ -376,11 +372,7 @@ def test_step_image(state, t_units, target, t_frames, coords, Omega, g, dtau, Si
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
-    dtft_mats: array,
-        An array of discrete time fourier transform matrices for each frame time
-    vis_sigma: array,
-        An array of standard deviations for each visibility measurement
-    
+
     Returns
     -------
     loss: jnp.array,
@@ -392,8 +384,8 @@ def test_step_image(state, t_units, target, t_frames, coords, Omega, g, dtau, Si
     -----
     Arguments for jax.pmap:
         axis_name='batch',
-        in_axes=(0, 0, 0, None, None, None, None, None, None, None, None, None, None, None)
-        static_broadcasted_argnums=(3),
+        in_axes=(0, None, 0, 0, None, None, None, None, None, None, None, None, None, None),
+        static_broadcasted_argnums=(1),
     """
     loss, [images] = loss_fn_image(
         state.params, state.apply_fn, target, t_frames, coords, Omega, g, dtau, Sigma, 
@@ -412,12 +404,16 @@ def train_step_eht(state, t_units, target, sigma, A, t_frames, coords, Omega, g,
     ----------
     state: flax.training.train_state.TrainState, 
         The training state holding the network parameters and apply_fn
-    target: array, 
-        Target eht observations to fit the model to. 
-    t_frames: array, 
-        Array of time for each image frame
     t_units: astropy.units, 
         Time units for t_frames.
+    target: array, 
+        Target measurement values to fit the model to. 
+    A: array,
+        An array of discrete time fourier transform matrices for each frame time
+    sigma: array,
+        An array of standard deviations for each measurement
+    t_frames: array, 
+        Array of time for each image frame
     coords: list of arrays, 
         For 3D emission coords=[x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
         alpha, beta are image coordinates. These arrays contain the ray integration points
@@ -438,11 +434,7 @@ def train_step_eht(state, t_units, target, sigma, A, t_frames, coords, Omega, g,
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
-    dtft_mats: array,
-        An array of discrete time fourier transform matrices for each frame time
-    vis_sigma: array,
-        An array of standard deviations for each visibility measurement
-    
+
     Returns
     -------
     loss: jnp.array,
@@ -454,8 +446,8 @@ def train_step_eht(state, t_units, target, sigma, A, t_frames, coords, Omega, g,
     -----
     Arguments for jax.pmap:
         axis_name='batch',
-        in_axes=(0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, 0, 0), 
-        static_broadcasted_argnums=(3),
+        in_axes=(0, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None),
+        static_broadcasted_argnums=(1),
     """
     (loss, [images]), grads = jax.value_and_grad(loss_fn_eht, argnums=(0), has_aux=True)(
         state.params, state.apply_fn, target, sigma, A, t_frames, coords, Omega, g, dtau, Sigma, 
@@ -476,12 +468,16 @@ def test_step_eht(state, t_units, target, sigma, A, t_frames, coords, Omega, g, 
     ----------
     state: flax.training.train_state.TrainState, 
         The training state holding the network parameters and apply_fn
-    target: array, 
-        Target eht observations to fit the model to. 
-    t_frames: array, 
-        Array of time for each image frame
     t_units: astropy.units, 
         Time units for t_frames.
+    target: array, 
+        Target measurement values to fit the model to. 
+    A: array,
+        An array of discrete time fourier transform matrices for each frame time
+    sigma: array,
+        An array of standard deviations for each measurement
+    t_frames: array, 
+        Array of time for each image frame
     coords: list of arrays, 
         For 3D emission coords=[x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
         alpha, beta are image coordinates. These arrays contain the ray integration points
@@ -502,11 +498,7 @@ def test_step_eht(state, t_units, target, sigma, A, t_frames, coords, Omega, g, 
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
-    dtft_mats: array,
-        An array of discrete time fourier transform matrices for each frame time
-    vis_sigma: array,
-        An array of standard deviations for each visibility measurement
-    
+
     Returns
     -------
     loss: jnp.array,
@@ -518,8 +510,8 @@ def test_step_eht(state, t_units, target, sigma, A, t_frames, coords, Omega, g, 
     -----
     Arguments for jax.pmap:
         axis_name='batch',
-        in_axes=(0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, 0, 0), 
-        static_broadcasted_argnums=(3),
+        in_axes=(0, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None),
+        static_broadcasted_argnums=(1),
     """
     loss, [images] = loss_fn_eht(state.params, state.apply_fn, target, sigma, A, t_frames, coords, Omega, g, dtau, Sigma, 
                                  t_start_obs, t_geos, t_injection, rmin, rmax, t_units)
@@ -557,9 +549,7 @@ def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames,
     t_injection: float, 
         Time of hotspot injection in M units.
     batched_args: list,
-        Additional arguments taken by the training_step function which should be batched along the first dimension (e.g. Fourier matrices)
-    args: list,
-        Additional arguments taken by the training_step function
+        Arguments taken by the training_step function which should be batched along the first dimension (e.g. Fourier matrices)
     emission_true: array, 
         A ground-truth array of 3D emission for evalutation metrics 
     vis_res: int, default=64
