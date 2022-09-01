@@ -117,15 +117,15 @@ def wave_vector(geos):
     Returns
     -------
     k_mu: xr.DataArray
-        A dataArray with the wave 4-vector 
+        A dataArray with the wave 4-vector: [k_t, k_r, k_th, k_ph]
     """
     # Plus-minus sign set according to angular (theta) and radial turning points 
     pm_r = np.sign(np.gradient(geos.r, axis=-1) / np.gradient(geos.affine, axis=-1))
     pm_th = np.sign(np.gradient(geos.theta, axis=-1) / np.gradient(geos.affine, axis=-1))
 
     k_t  = -geos.E
-    k_r  = geos.E * np.sqrt(geos.R) * pm_r / geos.Delta
-    k_th = geos.E * np.sqrt(geos.Theta) * pm_th
+    k_r  = geos.E * np.sqrt(geos.R.clip(min=0)) * pm_r / geos.Delta
+    k_th = geos.E * np.sqrt(geos.Theta.clip(min=0)) * pm_th
     k_ph = geos.E * geos.lam
     k_mu = xr.concat([k_t, k_r, k_th, k_ph], dim='mu')
     return k_mu
