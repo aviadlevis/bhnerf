@@ -10,7 +10,7 @@ from jax import jit
 import optax
 import os
 from flax.training import train_state
-from flax.training import checkpoints
+# from flax.training import checkpoints
 
 safe_sin = lambda x: jnp.sin(x % (100 * jnp.pi))
 

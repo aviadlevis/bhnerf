@@ -9,6 +9,14 @@ import jax
 from jax import numpy as jnp
 import functools
 
+
+def plot_evpa_ticks(Q, U, alpha, beta, ax=None, scale=None, color=None, pivot='mid', headaxislength=0, headlength=0, width=0.005):
+    aolp = (np.arctan2(U, Q) / 2) 
+    dolp = np.sqrt(Q**2 + U**2)
+    if ax is None: fig, ax = plt.subplots(1, 1)
+    ax.quiver(alpha, beta, dolp*np.sin(aolp), -dolp*np.cos(aolp), pivot='mid', 
+              headaxislength=0, headlength=0, width=0.005, scale=scale, color=color)
+    
 def slider_frame_comparison(frames1, frames2, scale='amp'):
     """
     Slider comparison of two 3D xr.DataArray along a chosen dimension.
