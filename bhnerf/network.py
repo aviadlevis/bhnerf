@@ -6,11 +6,12 @@ from jax import numpy as jnp
 from typing import Any, Callable
 import functools
 import bhnerf
+from bhnerf import kgeo
 from jax import jit
 import optax
 import os
 from flax.training import train_state
-# from flax.training import checkpoints
+from flax.training import checkpoints
 
 safe_sin = lambda x: jnp.sin(x % (100 * jnp.pi))
 
@@ -165,7 +166,7 @@ class NeRF_Predictor(nn.Module):
         emission = predict_emission(t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection_param)
         return emission
     
-def loss_fn_image(params, predictor_fn, target, t_frames, coords, Omega, 
+def loss_fn_image(params, predictor_fn, target, t_frames, coords, Omega, J,
                   g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, t_units):
     """
     An L2 loss function for image pixels
@@ -185,6 +186,8 @@ def loss_fn_image(params, predictor_fn, target, t_frames, coords, Omega,
         alpha, beta are image coordinates. These arrays contain the ray integration points
     Omega: array, 
         Angular velocity array sampled along the coords points
+    J: np.array(shape=(3,...)), 
+        Stokes vector scaling factors including parallel transport (I, Q, U)
     g: array, 
         doppler boosting factor, 
     dtau: array, 
@@ -211,12 +214,12 @@ def loss_fn_image(params, predictor_fn, target, t_frames, coords, Omega,
         An array of predicted images at different times (t_frames)
     """
     emission = predictor_fn({'params': params}, t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection)
-    emission = bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax, use_jax=True)
-    images = bhnerf.emission.radiative_trasfer(emission, g, dtau, Sigma, use_jax=True)
+    emission = J * bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax, use_jax=True)
+    images = kgeo.radiative_trasfer(emission, g, dtau, Sigma, use_jax=True)
     loss = jnp.mean(jnp.abs(images - target)**2)
     return loss, [images]
 
-def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega, 
+def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega, J,
                 g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, t_units, dtype):
     """
     An chi-square loss function for EHT observations
@@ -240,6 +243,8 @@ def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega,
         alpha, beta are image coordinates. These arrays contain the ray integration points
     Omega: array, 
         Angular velocity array sampled along the coords points
+    J: np.array(shape=(3,...)), 
+        Stokes vector scaling factors including parallel transport (I, Q, U)
     g: array, 
         doppler boosting factor, 
     dtau: array, 
@@ -272,8 +277,8 @@ def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega,
     Currently only supports complex visibilities
     """
     emission = predictor_fn({'params': params}, t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection)
-    emission = bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax, use_jax=True)
-    images = bhnerf.emission.radiative_trasfer(emission, g, dtau, Sigma, use_jax=True)
+    emission = J * bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax, use_jax=True)
+    images = kgeo.radiative_trasfer(emission, g, dtau, Sigma, use_jax=True)
     
     # Reshape images to match A operations
     image_vectors = images.reshape(images.shape[0], -1, 1)
@@ -291,7 +296,7 @@ def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega,
     return chisq, [images]
 
 @functools.partial(jit, static_argnums=(1))
-def train_step_image(state, t_units, target, t_frames, coords, Omega, g, dtau, Sigma,
+def train_step_image(state, t_units, target, t_frames, coords, Omega, J, g, dtau, Sigma,
                      t_start_obs, t_geos, t_injection, rmin, rmax):
     """
     Training step function for fitting the image-plane directly
@@ -311,6 +316,8 @@ def train_step_image(state, t_units, target, t_frames, coords, Omega, g, dtau, S
         alpha, beta are image coordinates. These arrays contain the ray integration points
     Omega: array, 
         Angular velocity array sampled along the coords points
+    J: np.array(shape=(3,...)), 
+        Stokes vector scaling factors including parallel transport (I, Q, U)
     g: array, 
         doppler boosting factor, 
     dtau: array, 
@@ -338,18 +345,18 @@ def train_step_image(state, t_units, target, t_frames, coords, Omega, g, dtau, S
     -----
     Arguments for jax.pmap:
         axis_name='batch',
-        in_axes=(0, None, 0, 0, None, None, None, None, None, None, None, None, None, None),
+        in_axes=(0, None, 0, 0, None, None, None, None, None, None, None, None, None, None, None),
         static_broadcasted_argnums=(1),
     """
     (loss, [images]), grads = jax.value_and_grad(loss_fn_image, argnums=(0), has_aux=True)(
-        state.params, state.apply_fn, target, t_frames, coords, Omega, g, dtau, Sigma, 
+        state.params, state.apply_fn, target, t_frames, coords, Omega, J, g, dtau, Sigma, 
         t_start_obs, t_geos, t_injection, rmin, rmax, t_units)
     grads = jax.lax.pmean(grads, axis_name='batch')
     state = state.apply_gradients(grads=grads)
     return loss, state, images
 
 @functools.partial(jit, static_argnums=(1))
-def test_step_image(state, t_units, target, t_frames, coords, Omega, g, dtau, Sigma, 
+def test_step_image(state, t_units, target, t_frames, coords, Omega, J, g, dtau, Sigma, 
                     t_start_obs, t_geos, t_injection, rmin, rmax):
     """
     Test step function for fitting the image-plane directly. 
@@ -371,6 +378,8 @@ def test_step_image(state, t_units, target, t_frames, coords, Omega, g, dtau, Si
         alpha, beta are image coordinates. These arrays contain the ray integration points
     Omega: array, 
         Angular velocity array sampled along the coords points
+    J: np.array(shape=(3,...)), 
+        Stokes vector scaling factors including parallel transport (I, Q, U)
     g: array, 
         doppler boosting factor, 
     dtau: array, 
@@ -398,16 +407,16 @@ def test_step_image(state, t_units, target, t_frames, coords, Omega, g, dtau, Si
     -----
     Arguments for jax.pmap:
         axis_name='batch',
-        in_axes=(0, None, 0, 0, None, None, None, None, None, None, None, None, None, None),
+        in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None), 
         static_broadcasted_argnums=(1),
     """
     loss, [images] = loss_fn_image(
-        state.params, state.apply_fn, target, t_frames, coords, Omega, g, dtau, Sigma, 
+        state.params, state.apply_fn, target, t_frames, coords, Omega, J, g, dtau, Sigma, 
         t_start_obs, t_geos, t_injection, rmin, rmax, t_units)
     return loss, images
 
 @functools.partial(jit, static_argnums=(1, 2))
-def train_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, g, dtau, Sigma, t_start_obs, 
+def train_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, J, g, dtau, Sigma, t_start_obs, 
                    t_geos, t_injection, rmin, rmax):
     """
     Train step function for fitting eht observations
@@ -437,6 +446,8 @@ def train_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Om
         alpha, beta are image coordinates. These arrays contain the ray integration points
     Omega: array, 
         Angular velocity array sampled along the coords points
+    J: np.array(shape=(3,...)), 
+        Stokes vector scaling factors including parallel transport (I, Q, U)
     g: array, 
         doppler boosting factor, 
     dtau: array, 
@@ -468,14 +479,14 @@ def train_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Om
         static_broadcasted_argnums=(1, 2))
     """
     (loss, [images]), grads = jax.value_and_grad(loss_fn_eht, argnums=(0), has_aux=True)(
-        state.params, state.apply_fn, target, sigma, A, t_frames, coords, Omega, g, dtau, Sigma, 
+        state.params, state.apply_fn, target, sigma, A, t_frames, coords, Omega, J, g, dtau, Sigma, 
         t_start_obs, t_geos, t_injection, rmin, rmax, t_units, dtype)
     grads = jax.lax.pmean(grads, axis_name='batch')
     state = state.apply_gradients(grads=grads)
     return loss, state, images
 
 @functools.partial(jit, static_argnums=(1, 2))
-def test_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, g, dtau, Sigma, 
+def test_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, J, g, dtau, Sigma, 
                   t_start_obs, t_geos, t_injection, rmin, rmax):
     """
     Test step function for fitting eht observations
@@ -503,6 +514,8 @@ def test_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Ome
         alpha, beta are image coordinates. These arrays contain the ray integration points
     Omega: array, 
         Angular velocity array sampled along the coords points
+    J: np.array(shape=(3,...)), 
+        Stokes vector scaling factors including parallel transport (I, Q, U)
     g: array, 
         doppler boosting factor, 
     dtau: array, 
@@ -530,14 +543,14 @@ def test_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Ome
     -----
     Arguments for jax.pmap:
         axis_name='batch',
-        in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None), 
+        in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None), 
         static_broadcasted_argnums=(1, 2))
     """
-    loss, [images] = loss_fn_eht(state.params, state.apply_fn, target, sigma, A, t_frames, coords, Omega, g, dtau, Sigma, 
+    loss, [images] = loss_fn_eht(state.params, state.apply_fn, target, sigma, A, t_frames, coords, Omega, J, g, dtau, Sigma, 
                                  t_start_obs, t_geos, t_injection, rmin, rmax, t_units, dtype)
     return loss, images
     
-def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames, geos, Omega, rmax, t_injection,
+def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames, geos, Omega, rmax, t_injection, J=1.0, 
                      batched_args=[], non_jit_args=[], emission_true=None, vis_res=64, log_period=100, save_period=1000):
     """
     Run a gradient descent optimization over the network parameters (3D emission) 
@@ -568,6 +581,8 @@ def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames,
         The maximum radius for recovery
     t_injection: float, 
         Time of hotspot injection in M units.
+    J: np.array(shape=(3,...)), default=1.0
+        Stokes vector scaling factors including parallel transport (I, Q, U). J=1.0 gives non-polarized emission.
     non_jit_args: list,
         Arguments that are not jitted (should appear in static_broadcasted_argnums)
     batched_args: list,
@@ -598,15 +613,15 @@ def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames,
     t_units = t_frames.unit
     non_jit_args = [t_units] + non_jit_args
     coords = jnp.array([geos.x, geos.y, geos.z])
-    umu = bhnerf.emission.azimuthal_velocity_vector(geos, Omega)
-    g = jnp.array(bhnerf.emission.doppler_factor(geos, umu))
+    umu = kgeo.azimuthal_velocity_vector(geos, Omega)
+    g = jnp.array(kgeo.doppler_factor(geos, umu))
     Omega = jnp.array(Omega)
     dtau = jnp.array(geos.dtau)
     Sigma = jnp.array(geos.Sigma)
     t_start_obs = t_frames[0]
     t_geos = jnp.array(geos.t)
     rmin = geos.r.min().data
-    rendering_args = [coords, Omega, g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax]
+    rendering_args = [coords, Omega, J, g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax]
     
     # Grid for visualization (no interpolation is added for easy comparison)
     if emission_true is not None:
