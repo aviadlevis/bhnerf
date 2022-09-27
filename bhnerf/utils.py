@@ -214,5 +214,5 @@ def anti_aliasing_filter(image_plane, window):
 def expand_dims(x, ndim, axis=0, use_jax=False):
     _np = jnp if use_jax else np
     for i in range(ndim-_np.array(x).ndim):
-        x = _np.expand_dims(x, axis=axis)
+        x = _np.expand_dims(x, axis=min(axis, _np.array(x).ndim))
     return x

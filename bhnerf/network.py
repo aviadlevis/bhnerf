@@ -214,8 +214,11 @@ def loss_fn_image(params, predictor_fn, target, t_frames, coords, Omega, J,
         An array of predicted images at different times (t_frames)
     """
     emission = predictor_fn({'params': params}, t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection)
-    emission = J * bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax, use_jax=True)
-    images = kgeo.radiative_trasfer(emission, g, dtau, Sigma, use_jax=True)
+    emission = bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax, use_jax=True)
+    if not jnp.isscalar(J):
+        J = bhnerf.utils.expand_dims(J, emission.ndim+1, 0, use_jax=True)
+        emission = bhnerf.utils.expand_dims(emission, emission.ndim+1, 1, use_jax=True)
+    images = kgeo.radiative_trasfer(emission*J, g, dtau, Sigma, use_jax=True)
     loss = jnp.mean(jnp.abs(images - target)**2)
     return loss, [images]
 
@@ -586,7 +589,7 @@ def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames,
     non_jit_args: list,
         Arguments that are not jitted (should appear in static_broadcasted_argnums)
     batched_args: list,
-        Arguments taken by the training_step function which should be batched along the first dimension (e.g. Fourier matrices)
+        Arguments taken by the training_step function which should be batched along the first dimension (e.g. frames or Fourier matrices)
     emission_true: array, 
         A ground-truth array of 3D emission for evalutation metrics 
     vis_res: int, default=64

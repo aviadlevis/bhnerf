@@ -417,8 +417,9 @@ def parallel_transport(geos, umu, g, b, Q_factor=0.2, spectral_index=1):
     f_local = np.cross(k_mu_prime, b, axis=-1) / k_mag[...,None]
     
     # Transform local evpa vector f to global coordinates. 
-    # Pad time component with zeros and right multiply by the tetrad.
-    f_global = np.pad(f_local, pad_width=((0,0), (0,0), (1,0)))
+    # Pad time component with zeros (last axis) and right multiply by the tetrad.
+    pad_width = [(0,0)]*(f_local.ndim-1) + [(1,0)]
+    f_global = np.pad(f_local, pad_width)
     f_global = transform_coordinates(f_global, e_mu, 'lower')
     ft, fr, fth, fph  = f_global[...,0], f_global[...,1], f_global[...,2], f_global[...,3]
 

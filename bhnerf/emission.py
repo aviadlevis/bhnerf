@@ -221,7 +221,9 @@ def image_plane_dynamics(emission_0, geos, Omega, t_frames, t_injection, b=None,
     
     # Use magnetic fields for polarized synchrotron radiation
     J = emission.data
-    if b is not None: J *= kgeo.parallel_transport(geos, umu, g, b)
+    if b is not None: 
+        pol_factors = utils.expand_dims(kgeo.parallel_transport(geos, umu, g, b), emission.ndim+1, axis=1)
+        J *= np.nan_to_num(pol_factors, 0.0)
         
     movie = kgeo.radiative_trasfer(J, np.array(g), np.array(geos.dtau), np.array(geos.Sigma))
     return movie
