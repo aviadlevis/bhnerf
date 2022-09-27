@@ -8,10 +8,6 @@ import functools
 import bhnerf
 from bhnerf import kgeo
 from jax import jit
-import optax
-import os
-from flax.training import train_state
-from flax.training import checkpoints
 
 safe_sin = lambda x: jnp.sin(x % (100 * jnp.pi))
 
@@ -88,16 +84,6 @@ def posenc(x, deg):
                      list(x.shape[:-1]) + [-1])
     four_feat = safe_sin(jnp.concatenate([xb, xb + 0.5 * jnp.pi], axis=-1))
     return jnp.concatenate([x] + [four_feat], axis=-1)
-
-def shard(xs):
-    """Split data into shards for multiple devices along the first dimension."""
-    return jax.tree_map(lambda x: x.reshape((jax.local_device_count(), -1) + x.shape[1:]), xs)
-
-def flattened_traversal(fn):
-    def mask(data):
-        flat = flax.traverse_util.flatten_dict(data)
-        return flax.traverse_util.unflatten_dict({k: fn(k, v) for k, v in flat.items()})
-    return mask
 
 class NeRF_Predictor(nn.Module):
     """
@@ -553,220 +539,44 @@ def test_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Ome
                                  t_start_obs, t_geos, t_injection, rmin, rmax, t_units, dtype)
     return loss, images
     
-def run_optimization(runname, hparams, predictor, train_pstep, target, t_frames, geos, Omega, rmax, t_injection, J=1.0, 
-                     batched_args=[], non_jit_args=[], emission_true=None, vis_res=64, log_period=100, save_period=1000):
+def sample_3d_grid(state, t_frames, tstart, rmin=0.0, rmax=np.inf, Omega=0.0, fov=None, coords=None, resolution=64): 
     """
-    Run a gradient descent optimization over the network parameters (3D emission) 
-    
     Parameters
     ----------
-    runname: str, 
-        String used for logging and saving checkpoints.
-    hparams: dict, 
-        'num_iters': int, number of iterations, 
-        'lr_init': float, initial learning rate,
-        'lr_final': float, final learning rate, 
-        'batchsize': int, should be an integer factor of the number of GPUs used
-    predictor: flax.training.train_state.TrainState, 
-        The training state holding the network parameters and apply_fn
-    train_pstep: jax.pmap, 
-        A parallel mapping of the training function (e.g. train_step_image or train_step_eht)
-    target: array, 
-        Target to fit the model to (image pixels or eht observations depending on train_pstep)
     t_frames: array, 
-        Array of time for each image frame with astropy.units, 
-        Time units for t_frames.
-    geos: xr.Dataset
-        A dataset specifying geodesics (ray trajectories) ending at the image plane.
-    Omega: xr.DataArray
-        A dataarray specifying the keplerian velocity field
-    rmax: float, 
-        The maximum radius for recovery
-    t_injection: float, 
-        Time of hotspot injection in M units.
-    J: np.array(shape=(3,...)), default=1.0
-        Stokes vector scaling factors including parallel transport (I, Q, U). J=1.0 gives non-polarized emission.
-    non_jit_args: list,
-        Arguments that are not jitted (should appear in static_broadcasted_argnums)
-    batched_args: list,
-        Arguments taken by the training_step function which should be batched along the first dimension (e.g. frames or Fourier matrices)
-    emission_true: array, 
-        A ground-truth array of 3D emission for evalutation metrics 
-    vis_res: int, default=64
-        Resolution (number of grid points in x,y,z) at which to visualize the contiuous 3D emission
-    log_period: int, default=100
-        TensorBoard logging every `log_period` iterations
-    save_period: int, default=1000
-        Save checkpoint every `save_period` iterations
-        
-    Returns
-    -------
-    current_state: flax.training.train_state.TrainState, 
-        The training state holding the network parameters at the end of the optimization
+        Array of time for each image frame
+    t_start: astropy.Quantity, default=None
+        Start time for observations.
+    rmin: float, default=0
+        Zero values at radii < rmin
+    rmax: float, default=np.inf
+        Zero values at radii > rmax,
+    Omega: array or float, default=0.0 
+        Angular velocity array sampled along the coords. If initial time is sampled Omega has no effect and could be 0.0.
+    fov: float, default=None
+        Field of view. If None then coords need to be provided.
+    coords: array(shape=(3,npoints)), optional, 
+        Array of grid coordinates (x, y, z). If not specified, fov and resolution are used to grid the domain.
+    resolution: int, default=64
+        Grid resolution along [x,y,z].
     """
+    try:
+        state = jax.device_get(flax.jax_utils.unreplicate(state))
+    except IndexError:
+        state = jax.device_get(state)
     
-    from tensorboardX import SummaryWriter
-    from tqdm.notebook import tqdm
-    
-    # Logging parameters
-    checkpoint_dir = '../checkpoints/{}'.format(runname)
-    logdir = '../runs/{}'.format(runname)
-    
-    # Image rendering arguments
-    t_units = t_frames.unit
-    non_jit_args = [t_units] + non_jit_args
-    coords = jnp.array([geos.x, geos.y, geos.z])
-    umu = kgeo.azimuthal_velocity_vector(geos, Omega)
-    g = jnp.array(kgeo.doppler_factor(geos, umu))
-    Omega = jnp.array(Omega)
-    dtau = jnp.array(geos.dtau)
-    Sigma = jnp.array(geos.Sigma)
-    t_start_obs = t_frames[0]
-    t_geos = jnp.array(geos.t)
-    rmin = geos.r.min().data
-    rendering_args = [coords, Omega, J, g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax]
-    
-    # Grid for visualization (no interpolation is added for easy comparison)
-    if emission_true is not None:
-        vis_coords = np.array(np.meshgrid(np.linspace(emission_true.x[0], emission_true.x[-1], emission_true.shape[0]),
-                                          np.linspace(emission_true.y[0], emission_true.y[-1], emission_true.shape[1]),
-                                          np.linspace(emission_true.z[0], emission_true.z[-1], emission_true.shape[2]),
-                                          indexing='ij'))
-    else:
-        grid_1d = np.linspace(-rmax, rmax, vis_res)
-        vis_coords = np.array(np.meshgrid(grid_1d, grid_1d, grid_1d, indexing='ij'))
-
-    params = predictor.init(jax.random.PRNGKey(1), t_frames[0], t_units, coords, Omega, t_start_obs, t_geos, t_injection)['params']
-    
-    tx = optax.adam(learning_rate=optax.polynomial_schedule(hparams['lr_init'], hparams['lr_final'], 1, hparams['num_iters']))
-    if 'lr_inject' in hparams.keys():
-        tx = optax.chain(
-            optax.masked(optax.adam(learning_rate=hparams['lr_inject']), mask=flattened_traversal(lambda path, _: path[-1] == 't_injection')),
-            optax.masked(tx, mask=flattened_traversal(lambda path, _: path[-1] != 't_injection')),
-        )
+    if (coords is None) and (fov is not None):
+        grid_1d = np.linspace(-fov/2, fov/2, resolution)
+        coords = np.array(np.meshgrid(grid_1d, grid_1d, grid_1d, indexing='ij'))
+    elif (coords is None):
+        raise AttributeError('Either coords or fov+resolution must be provided')
         
-    state = train_state.TrainState.create(apply_fn=predictor.apply, params=params.unfreeze(), tx=tx)  # TODO(pratul): this unfreeze feels sketchy
-
-    # Restore saved checkpoint
-    # if np.isscalar(save_period): state = checkpoints.restore_checkpoint(checkpoint_dir, state)
-    init_step = 1 + state.step
-    
-    # Replicate state for multiple gpus
-    state = flax.jax_utils.replicate(state)
-    with SummaryWriter(logdir=logdir) as writer:
-        if emission_true is not None: writer.add_images('emission/true', bhnerf.utils.intensity_to_nchw(emission_true), global_step=0)
-
-        for i in tqdm(range(init_step, init_step + hparams['num_iters']), desc='iteration'):
-            batch = np.random.choice(range(len(t_frames)), hparams['batchsize'], replace=False)
-            bargs = [shard(arg[batch, ...]) for arg in batched_args]
-            loss, state, images = train_pstep(state, *non_jit_args, *bargs, *rendering_args)
-
-            # Log the current state on TensorBoard
-            writer.add_scalar('log_loss/train', np.log10(np.mean(loss)), global_step=i)
-            if (i == 1) or ((i % log_period) == 0) or (i ==  init_step + hparams['num_iters']):
-                current_state = jax.device_get(flax.jax_utils.unreplicate(state))
-                emission_grid = state.apply_fn({'params': current_state.params}, t_frames[0], t_units, vis_coords, 0.0, t_start_obs, 0.0, 0.0)
-                emission_grid = bhnerf.emission.fill_unsupervised_emission(emission_grid, vis_coords, rmin, rmax)
-                writer.add_images('emission/estimate', bhnerf.utils.intensity_to_nchw(emission_grid), global_step=i)
-                if 'lr_inject' in hparams.keys(): writer.add_scalar('t_injection', float(current_state.params['t_injection']), global_step=i)
-                if emission_true is not None:
-                    writer.add_scalar('emission/mse', bhnerf.utils.mse(emission_true.data, emission_grid), global_step=i)
-                    writer.add_scalar('emission/psnr', bhnerf.utils.psnr(emission_true.data, emission_grid), global_step=i)
-
-            # Save checkpoints occasionally
-            if np.isscalar(save_period) and ((i % save_period == 0) or (i ==  init_step + hparams['num_iters'])):
-                current_state = jax.device_get(flax.jax_utils.unreplicate(state))
-                checkpoints.save_checkpoint(checkpoint_dir, current_state, int(i), keep=5)
-    return current_state
-
-
-def total_movie_loss(runname, batchsize, predictor, test_pstep, target, t_frames, geos, rmax, 
-                     t_injection, lr_inject=True, return_frames=False, batched_args=[], args=[]):
-    """
-    This function chunks up the movie into frames which fit on GPUs and sums the total loss over all frames 
-    
-    Parameters
-    ----------
-    runname: str, 
-        String used for logging and saving checkpoints.
-    batchsize: int, 
-        Should be an integer factor of the number of GPUs used
-    predictor: flax.training.train_state.TrainState, 
-        The training state holding the network parameters and apply_fn
-    trest_pstep: jax.pmap, 
-        A parallel mapping of the testing function (e.g. test_step_image or test_step_eht)
-    target: array, 
-        Target to fit the model to (image pixels or eht observations depending on train_pstep)
-    t_frames: array, 
-        Array of time for each image frame with astropy.units, 
-        Time units for t_frames.
-    geos: xr.Dataset
-        A dataset specifying geodesics (ray trajectories) ending at the image plane.
-    rmax: float, 
-        The maximum radius for recovery
-    t_injection: float, 
-        Time of hotspot injection in M units.
-    lr_inject: bool, default=True
-        True for optimized injection time. 
-    return_frames: bool, default=False, 
-        Return the estimated movie frames
-    batched_args: list,
-        Additional arguments taken by the training_step function which should be batched along the first dimension (e.g. Fourier matrices)
-    args: list,
-        Additional arguments taken by the training_step function
+    if not all(np.atleast_1d(t_frames == tstart)) and (Omega==None):
+        raise AttributeError('If t_frames != tstart, an angular velocity Omega!=0.0 needs to be provided')
         
-    Returns
-    -------
-    total_loss: float,
-        The total loss over all frames.
-    """
-        
-    checkpoint_dir = os.path.join('../checkpoints', runname)
-    if not os.path.exists(checkpoint_dir): 
-        raise AttributeError('checkpoint directory does not exist: {}'.format(checkpoint_dir))
-        
-    # Image rendering arguments
-    t_units = t_frames.unit
-    coords = jnp.array([geos.x, geos.y, geos.z])
-    Omega = jnp.array(geos.Omega)
-    g = jnp.array(geos.g.fillna(0.0))
-    dtau = jnp.array(geos.dtau)
-    Sigma = jnp.array(geos.Sigma)
-    t_start_obs = t_frames[0]
-    t_geos = jnp.array(geos.t)
-    rmin = geos.r.min().data
-    rendering_args = [coords, Omega, g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax]
+    # Get the a grid values sampled from the neural network
+    emission = state.apply_fn({'params': state.params}, t_frames, tstart.unit, coords, Omega, tstart, 0.0, 0.0)
+    emission =  bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax)
     
-    params = predictor.init(jax.random.PRNGKey(1), t_frames[0], t_units, coords, Omega, t_start_obs, t_geos, t_injection)['params']
-    tx = optax.adam(learning_rate=optax.polynomial_schedule(1, 1, 1, 1))
-    if 'lr_inject':
-        tx = optax.chain(
-            optax.masked(optax.adam(learning_rate=0), mask=flattened_traversal(lambda path, _: path[-1] == 't_injection')),
-            optax.masked(tx, mask=flattened_traversal(lambda path, _: path[-1] != 't_injection')),
-        )
-    state = train_state.TrainState.create(apply_fn=predictor.apply, params=params.unfreeze(), tx=tx)  # TODO(pratul): this unfreeze feels sketchy
-    state = checkpoints.restore_checkpoint(checkpoint_dir, state)
-    state = flax.jax_utils.replicate(state)
+    return emission
     
-    # Split times according to batchsize
-    nt = len(t_frames)
-    nt_tilde = nt - nt % batchsize
-    indices = np.array_split(np.arange(0, nt_tilde), nt_tilde/batchsize)
-    indices.append(np.arange(nt-nt % batchsize, nt))
-
-    # Aggregate loss over all t_frames
-    total_loss = 0.0
-    frames = []
-    for inds in indices:
-        if (inds.size == 0): break
-        bargs = [shard(arg[inds, ...]) for arg in batched_args]
-        loss, images = test_pstep(state, shard(target[inds, ...]), shard(t_frames[inds, ...]), t_units, *rendering_args, *bargs, *args)
-        total_loss += float((batchsize // jax.device_count()) * loss.sum())
-        if return_frames:
-            frames.append(images.reshape(-1, geos.alpha.size, geos.beta.size))
-            
-    output = total_loss
-    if return_frames:
-        output = (total_loss, np.concatenate(frames))
-        
-    return output
