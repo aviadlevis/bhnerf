@@ -17,26 +17,24 @@ def plot_evpa_ticks(Q, U, alpha, beta, ax=None, scale=None, color=None, pivot='m
     ax.quiver(alpha, beta, dolp*np.sin(aolp), -dolp*np.cos(aolp), pivot='mid', 
               headaxislength=0, headlength=0, width=0.005, scale=scale, color=color)
     
-def slider_frame_comparison(frames1, frames2, scale='amp'):
+def slider_frame_comparison(frames1, frames2, axis=0, scale='amp'):
     """
     Slider comparison of two 3D xr.DataArray along a chosen dimension.
     Parameters
     ----------
     frames1: xr.DataArray
-        A 3D DataArray with 't' dimension to compare along
+        A 3D array with 'axis' dimension to compare along
     frames2:  xr.DataArray
-        A 3D DataArray with 't' dimension to compare along
+        A 3D array with 'axis' dimension to compare along
     scale: 'amp' or 'log', default='amp'
         Compare absolute values or log of the fractional deviation.
     """
     fig, axes = plt.subplots(1, 3, figsize=(9, 3))
     plt.tight_layout()
-    mean_images = [frames1.mean(axis=0), frames2.mean(axis=0),
-                   (np.abs(frames1 - frames2)).mean(axis=0)]
+    mean_images = [frames1.mean(axis=axis), frames2.mean(axis=axis),
+                   (np.abs(frames1 - frames2)).mean(axis=axis)]
     cbars = []
     titles = [None]*3
-    titles[0] = frames1.name if frames1.name is not None else 'Movie1'
-    titles[1] = frames2.name if frames2.name is not None else 'Movie2'
     if scale == 'amp':
         titles[2] = 'Absolute difference'
     elif scale == 'log':
@@ -51,20 +49,20 @@ def slider_frame_comparison(frames1, frames2, scale='amp'):
         cbars.append(fig.colorbar(im, cax=cax))
 
     def imshow_frame(frame):
-        image1 = frames1[frame]
-        image2 = frames2[frame]
+        image1 = np.take(frames1, frame, axis=axis)
+        image2 = np.take(frames2, frame, axis=axis)
 
         if scale == 'amp':
-            image3 = np.abs(frames1[frame] - frames2[frame])
+            image3 = np.abs(np.take(frames1, frame, axis=axis) - np.take(frames2, frame, axis=axis))
         elif scale == 'log':
-            image3 = np.log(np.abs(frames1[frame] / frames2[frame]))
+            image3 = np.log(np.abs(np.take(frames1, frame, axis=axis) / np.take(frames2, frame, axis=axis)))
 
         for ax, img, title, cbar in zip(axes, [image1, image2, image3], titles, cbars):
             ax.imshow(img, origin='lower')
             ax.set_title(title)
             cbar.mappable.set_clim([img.min(), img.max()])
 
-    num_frames = min(frames1.t.size, frames2.t.size)
+    num_frames = min(frames1.shape[axis], frames2.shape[axis])
     plt.tight_layout()
     interact(imshow_frame, frame=(0, num_frames-1));
     

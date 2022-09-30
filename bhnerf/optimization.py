@@ -10,7 +10,7 @@ from flax.training import checkpoints
 from astropy import units
     
 def run(runname, hparams, predictor, train_pstep, geos, Omega, rmax, t_injection, batched_args, J=1.0, 
-        dtype=None, emission_true=None, vis_res=64, log_period=100, save_period=1000):
+        emission_true=None, vis_res=64, log_period=100, save_period=1000):
     """
     Run a gradient descent optimization over the network parameters (3D emission) 
     
@@ -40,9 +40,6 @@ def run(runname, hparams, predictor, train_pstep, geos, Omega, rmax, t_injection
         See BatchedTemporalArgs classmethods for more information.
     J: np.array(shape=(3,...)), default=1.0
         Stokes vector scaling factors including parallel transport (I, Q, U). J=1.0 gives non-polarized emission.
-    dtype: str, default=None
-        1. For image optimization dtype=None. 
-        2. For eht optimization dtype=['vis', 'cphase'] is supported. Dtype is not jitted (should appear in static_broadcasted_argnums).
     emission_true: array, 
         A ground-truth array of 3D emission for evalutation metrics 
     vis_res: int, default=64
@@ -79,8 +76,8 @@ def run(runname, hparams, predictor, train_pstep, geos, Omega, rmax, t_injection
     rendering_args = [coords, Omega, J, g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax]
     
     non_jit_args = [t_units]
-    if (train_pstep.__name__ != 'train_step_image') and (dtype is not None):
-        non_jit_args += [dtype]
+    if (train_pstep.__name__ != 'train_step_image') and (batched_args.dtype is not None):
+        non_jit_args += [batched_args.dtype]
     
     # Grid for visualization (no interpolation is added for easy comparison)
     if emission_true is not None:
@@ -95,6 +92,7 @@ def run(runname, hparams, predictor, train_pstep, geos, Omega, rmax, t_injection
     params = predictor.init(jax.random.PRNGKey(1), t_start_obs, t_units, coords, Omega, t_start_obs, t_geos, t_injection)['params']
     
     tx = optax.adam(learning_rate=optax.polynomial_schedule(hparams['lr_init'], hparams['lr_final'], 1, hparams['num_iters']))
+    # tx = optax.adam(learning_rate=optax.polynomial_schedule(hparams['lr_init'], hparams['lr_final'], 1, hparams['num_iters']))
     if 'lr_inject' in hparams.keys():
         tx = optax.chain(
             optax.masked(optax.adam(learning_rate=hparams['lr_inject']), mask=flattened_traversal(lambda path, _: path[-1] == 't_injection')),
@@ -118,7 +116,7 @@ def run(runname, hparams, predictor, train_pstep, geos, Omega, rmax, t_injection
             # Log the current state on TensorBoard
             writer.add_scalar('log_loss/train', np.log10(np.mean(loss)), global_step=i)
             if (i == 1) or ((i % log_period) == 0) or (i ==  init_step + hparams['num_iters']):
-                emission_grid = bhnerf.network.sample_3d_grid(state, t_start_obs, t_start_obs, rmin, rmax, coords=vis_coords)
+                emission_grid = bhnerf.network.sample_3d_grid(state.apply_fn, state.params, rmin, rmax, coords=vis_coords)
                 writer.add_images('emission/estimate', bhnerf.utils.intensity_to_nchw(emission_grid), global_step=i)
                 if 'lr_inject' in hparams.keys(): writer.add_scalar('t_injection', float(current_state.params['t_injection']), global_step=i)
                 if emission_true is not None:
@@ -224,7 +222,7 @@ def total_movie_loss(runname, batchsize, predictor, test_pstep, target, t_frames
 
 class TemporalBatchedArgs(object):
     
-    def __init__(self, t_frames, args=[]):
+    def __init__(self, t_frames, args=[], dtype=None):
         self.t_frames = t_frames
         if not isinstance(args, list): args = [args]
         self.num_frames = len(t_frames)
@@ -232,6 +230,7 @@ class TemporalBatchedArgs(object):
         args.append(t_frames)
         self.args = args
         self.default_t_units = units.hr
+        self.dtype = dtype
 
     def sample(self, batchsize, replace=False):
         batch = np.random.choice(range(self.num_frames), batchsize, replace=replace)
@@ -249,11 +248,12 @@ class TemporalBatchedArgs(object):
             Array of time for each image frame with astropy.units. If no units are included defaults to Hours.
         image_plane: np.array
             A movie array with image-plane frames (first axis should have same length as t_frames)
+            For stokes concatenate movies along the second axis: np.stack([I, Q, U], axis=1)
         """
         return cls(t_frames, image_plane)
     
     @classmethod
-    def train_step_eht(cls, t_frames, target, sigma, A):
+    def train_step_eht(cls, t_frames, obs, image_fov, image_size, chisqdata, pol='I'):
         """
         batched arguments for training on eht observations.
         
@@ -268,7 +268,28 @@ class TemporalBatchedArgs(object):
         A: array,
             An array of discrete time fourier transform matrices for each frame time
         """
-        return cls(t_frames, [target, sigma, A])
+        from ehtim.image import make_square
+        dtype = chisqdata.__name__.split('_')[-1]
+        pol_types = ['I', 'Q', 'U'] 
+        
+        obs_frames = obs.split_obs(t_gather=(t_frames[-1]-t_frames[0]).to('s').value / (len(t_frames)+1))
+        prior = make_square(obs, image_size, image_fov)
+        
+        target, sigma, A = [], [], [] 
+        for p in np.atleast_1d(pol):
+            if p not in pol_types: raise AttributeError('pol ({}) not in supported pol_types: {},{},{}'.format(p, *pol_types))
+            target_p, sigma_p, A_p = [np.array(out) for out in zip(*[chisqdata(obs, prior, mask=[], pol=p) for obs in obs_frames])]
+            target.append(target_p)
+            sigma.append(sigma_p)
+            A.append(A_p)
+        target, sigma, A = np.squeeze(np.stack(target, axis=1)), np.squeeze(np.stack(sigma, axis=1)), np.squeeze(np.stack(A, axis=1))
+        
+        # ehtim cphases are in degrees and not radians
+        if dtype == 'cphase':
+            target, sigma = np.deg2rad(target), np.deg2rad(sigma)
+            
+        return cls(t_frames, [target, sigma, A], dtype)
+    
     
     @property
     def t_units(self):

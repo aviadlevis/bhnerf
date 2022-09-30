@@ -174,7 +174,7 @@ def interpolate_coords(emission, coords):
     interpolated_data = scipy.ndimage.map_coordinates(emission, image_coords, order=1, cval=0.)
     return interpolated_data
 
-def image_plane_dynamics(emission_0, geos, Omega, t_frames, t_injection, b=None, t_start_obs=None, rot_axis=[0,0,1], M=consts.sgra_mass):
+def image_plane_dynamics(emission_0, geos, Omega, t_frames, t_injection, J=1.0, t_start_obs=None, rot_axis=[0,0,1], M=consts.sgra_mass):
     """
     Compute the image-plane dynamics (movie) for a given initial emission and geodesics.
     
@@ -190,9 +190,8 @@ def image_plane_dynamics(emission_0, geos, Omega, t_frames, t_injection, b=None,
         Array of time for each image frame with astropy.units
     t_injection: float, 
         Time of hotspot injection in M units.
-    b: np.array(shape=(...,3)), default=None,
-        Magnetic field vector components on the geodesic grid. None means no magnetic fields (non-polarized emission).
-        The magnetic field is in the global coordinate system
+    J: np.array(shape=(3,...)), default=None,
+        Stokes polarization factors on the geodesic grid. None means no magnetic fields (non-polarized emission).
     t_start_obs: astropy.Quantity, default=None
         Start time for observations, if None t_frames[0] is assumed to be start time.
     rot_axis: array, default=[0, 0, 1]
@@ -202,8 +201,8 @@ def image_plane_dynamics(emission_0, geos, Omega, t_frames, t_injection, b=None,
         
     Returns
     -------
-    movie: np.array
-        A movie array with image-plane frames
+    images: np.array
+        A movie array with image-plane frames. Polarization components are given along axis=1.
     """
     warped_coords = velocity_warp_coords(
         coords=[geos.x, geos.y, geos.z],
@@ -220,13 +219,12 @@ def image_plane_dynamics(emission_0, geos, Omega, t_frames, t_injection, b=None,
     g = kgeo.doppler_factor(geos, umu)
     
     # Use magnetic fields for polarized synchrotron radiation
-    J = emission.data
-    if b is not None: 
-        pol_factors = utils.expand_dims(kgeo.parallel_transport(geos, umu, g, b), emission.ndim+1, axis=1)
-        J *= np.nan_to_num(pol_factors, 0.0)
-        
-    movie = kgeo.radiative_trasfer(J, np.array(g), np.array(geos.dtau), np.array(geos.Sigma))
-    return movie
+    if not jnp.isscalar(J):
+        J = utils.expand_dims(J, emission.ndim+1, 0, use_jax=True)
+        emission = J * utils.expand_dims(emission, emission.ndim+1, 1, use_jax=True)
+        emission = np.squeeze(emission)
+    images = kgeo.radiative_trasfer(emission, np.array(g), np.array(geos.dtau), np.array(geos.Sigma))
+    return images
 
 def fill_unsupervised_emission(emission, coords, rmin=0, rmax=np.Inf, fill_value=0.0, use_jax=False):
     """

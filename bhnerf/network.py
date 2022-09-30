@@ -152,6 +152,60 @@ class NeRF_Predictor(nn.Module):
         emission = predict_emission(t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection_param)
         return emission
     
+def image_plane_prediction(params, predictor_fn, t_frames, coords, Omega, J,
+                     g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, t_units):
+    """
+    Predict image pixels from NeRF emission values
+
+    Parameters
+    ----------
+    params: dict, 
+        A dictionary with network parameters (from state.params)
+    predictor_fn: nn.Module
+        A coordinate-based neural net for predicting the emission values as a continuous function
+    t_frames: array, 
+        Array of time for each image frame
+    coords: list of arrays, 
+        For 3D emission coords=[x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
+        alpha, beta are image coordinates. These arrays contain the ray integration points
+    Omega: array, 
+        Angular velocity array sampled along the coords points
+    J: np.array(shape=(3,...)), 
+        Stokes vector scaling factors including parallel transport (I, Q, U)
+    g: array, 
+        doppler boosting factor, 
+    dtau: array, 
+        mino time differential
+    Sigma: array, 
+    t_start_obs: astropy.Quantity, default=None
+        Start time for observations, if None t_frames[0] is assumed to be start time.
+    t_geos: array, 
+        Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
+    t_injection: float, 
+        Time of hotspot injection in M units.
+    rmin: float, 
+        The minimum radius for recovery
+    rmax: float, 
+        The maximum radius for recovery
+    t_units: astropy.units, 
+        Time units for t_frames.
+        
+    Returns
+    -------
+    loss: jnp.array,
+        An array with loss values (the size is the number of GPUs)
+    images: jnp.array
+        An array of predicted images at different times (t_frames)
+    """
+    emission = predictor_fn({'params': params}, t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection)
+    emission = bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax, use_jax=True)
+    if not jnp.isscalar(J):
+        J = bhnerf.utils.expand_dims(J, emission.ndim+1, 0, use_jax=True)
+        emission = J * bhnerf.utils.expand_dims(emission, emission.ndim+1, 1, use_jax=True)
+        emission = jnp.squeeze(emission)
+    images = kgeo.radiative_trasfer(emission, g, dtau, Sigma, use_jax=True)
+    return images
+
 def loss_fn_image(params, predictor_fn, target, t_frames, coords, Omega, J,
                   g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, t_units):
     """
@@ -199,13 +253,11 @@ def loss_fn_image(params, predictor_fn, target, t_frames, coords, Omega, J,
     images: jnp.array
         An array of predicted images at different times (t_frames)
     """
-    emission = predictor_fn({'params': params}, t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection)
-    emission = bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax, use_jax=True)
-    if not jnp.isscalar(J):
-        J = bhnerf.utils.expand_dims(J, emission.ndim+1, 0, use_jax=True)
-        emission = bhnerf.utils.expand_dims(emission, emission.ndim+1, 1, use_jax=True)
-    images = kgeo.radiative_trasfer(emission*J, g, dtau, Sigma, use_jax=True)
-    loss = jnp.mean(jnp.abs(images - target)**2)
+    images = image_plane_prediction(
+        params, predictor_fn, t_frames, coords, Omega, J,g, dtau, Sigma,
+        t_start_obs, t_geos, t_injection, rmin, rmax, t_units
+    )
+    loss = jnp.sum(jnp.abs(images - target)**2)
     return loss, [images]
 
 def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega, J,
@@ -265,22 +317,25 @@ def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega,
     -----
     Currently only supports complex visibilities
     """
-    emission = predictor_fn({'params': params}, t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection)
-    emission = J * bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax, use_jax=True)
-    images = kgeo.radiative_trasfer(emission, g, dtau, Sigma, use_jax=True)
+    images = image_plane_prediction(
+        params, predictor_fn, t_frames, coords, Omega, J,g, dtau, Sigma,
+        t_start_obs, t_geos, t_injection, rmin, rmax, t_units
+    )
     
     # Reshape images to match A operations
-    image_vectors = images.reshape(images.shape[0], -1, 1)
-    image_vectors = bhnerf.utils.expand_dims(image_vectors, A.ndim, axis=1, use_jax=True)
+    image_vectors = images.reshape(*images.shape[:-2], -1, 1)
+    image_vectors = bhnerf.utils.expand_dims(image_vectors, A.ndim, axis=-3, use_jax=True)
     visibilities = jnp.squeeze(jnp.matmul(A, image_vectors), -1)
     
     if dtype == 'vis':
-        if A.ndim != 3: raise AttributeError('A matrix should have 3 dimensions for cphase dtype')
-        chisq = jnp.mean((jnp.abs(visibilities - target)/sigma)**2)
+        if visibilities.ndim != target.ndim: 
+            raise AttributeError('visibilities (ndim={}) should have same dimensions as target (ndim={}) for dtype={}'.format(visibilities.ndim, target.ndim, dtype))
+        chisq = jnp.sum((jnp.abs(visibilities - target)/sigma)**2)
     elif dtype == 'cphase':
-        if A.ndim != 4: raise AttributeError('A matrix should have 4 dimensions for cphase dtype')
-        clphase_samples = jnp.angle(jnp.product(visibilities, axis=1))
-        chisq = jnp.mean((1.0 - jnp.cos(target-clphase_samples))/(sigma**2))
+        if visibilities.ndim != target.ndim+1: 
+            raise AttributeError('visibilities (ndim={}) should have +1 dimensions as target (ndim={}) for dtype={}'.format(visibilities.ndim, target.ndim, dtype))
+        clphase_samples = jnp.angle(jnp.product(visibilities, axis=-2))
+        chisq = jnp.sum((1.0 - jnp.cos(target-clphase_samples))/(sigma**2))
         
     return chisq, [images]
 
@@ -539,12 +594,13 @@ def test_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Ome
                                  t_start_obs, t_geos, t_injection, rmin, rmax, t_units, dtype)
     return loss, images
     
-def sample_3d_grid(state, t_frames, tstart, rmin=0.0, rmax=np.inf, Omega=0.0, fov=None, coords=None, resolution=64): 
+    
+def sample_3d_grid(apply_fn, params, rmin=0.0, rmax=np.inf, fov=None, coords=None, resolution=64): 
     """
     Parameters
     ----------
     t_frames: array, 
-        Array of time for each image frame
+        Array of time for each volume
     t_start: astropy.Quantity, default=None
         Start time for observations.
     rmin: float, default=0
@@ -559,24 +615,39 @@ def sample_3d_grid(state, t_frames, tstart, rmin=0.0, rmax=np.inf, Omega=0.0, fo
         Array of grid coordinates (x, y, z). If not specified, fov and resolution are used to grid the domain.
     resolution: int, default=64
         Grid resolution along [x,y,z].
-    """
+    """   
     try:
-        state = jax.device_get(flax.jax_utils.unreplicate(state))
+        params = jax.device_get(flax.jax_utils.unreplicate(params))
     except IndexError:
-        state = jax.device_get(state)
+        params = jax.device_get(params)
     
     if (coords is None) and (fov is not None):
         grid_1d = np.linspace(-fov/2, fov/2, resolution)
         coords = np.array(np.meshgrid(grid_1d, grid_1d, grid_1d, indexing='ij'))
     elif (coords is None):
         raise AttributeError('Either coords or fov+resolution must be provided')
-        
-    if not all(np.atleast_1d(t_frames == tstart)) and (Omega==None):
-        raise AttributeError('If t_frames != tstart, an angular velocity Omega!=0.0 needs to be provided')
-        
+
     # Get the a grid values sampled from the neural network
-    emission = state.apply_fn({'params': state.params}, t_frames, tstart.unit, coords, Omega, tstart, 0.0, 0.0)
+    emission = apply_fn({'params': params}, 0.0, None, coords, 0.0, 0.0, 0.0, 0.0)
     emission =  bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax)
-    
     return emission
     
+def load_checkpoint(path, predictor):
+    """
+    Load network checkpoint. 
+    
+    Parameters
+    ----------
+    path: str, 
+        Path to directory (loads latest checkpoint) or a specific checkpoint
+    predictor: nn.Module,
+        A NN predictor module to restore weights to. Should match the checkpoint module.
+        
+    Returns
+    -------
+    state: flax.training.train_state.TrainState, 
+        The training state holding the network parameters at the end of the optimization
+    """
+    from flax.training import checkpoints
+    state = checkpoints.restore_checkpoint(path, None)
+    return state
