@@ -206,8 +206,8 @@ def image_plane_prediction(params, predictor_fn, t_frames, coords, Omega, J,
     images = kgeo.radiative_trasfer(emission, g, dtau, Sigma, use_jax=True)
     return images
 
-def loss_fn_image(params, predictor_fn, target, t_frames, coords, Omega, J,
-                  g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, t_units):
+def loss_fn_image(params, predictor_fn, target, t_frames, coords, Omega, J, g, dtau, 
+                  Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, scale, t_units, dtype):
     """
     An L2 loss function for image pixels
 
@@ -243,8 +243,12 @@ def loss_fn_image(params, predictor_fn, target, t_frames, coords, Omega, J,
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
+    scale: float, 
+        Scaling factor for the loss
     t_units: astropy.units, 
         Time units for t_frames.
+    dtype: 'str',
+        Datatype to compute the loss for ('full'/'lightcurve' etc..)
         
     Returns
     -------
@@ -257,11 +261,15 @@ def loss_fn_image(params, predictor_fn, target, t_frames, coords, Omega, J,
         params, predictor_fn, t_frames, coords, Omega, J,g, dtau, Sigma,
         t_start_obs, t_geos, t_injection, rmin, rmax, t_units
     )
-    loss = jnp.sum(jnp.abs(images - target)**2)
-    return loss, [images]
+    if dtype == 'full':
+        loss = jnp.sum(jnp.abs(images - target)**2)
+    else:
+        raise AttributeError('image dtype ({}) not supported'.format(dtype))
+        
+    return scale*loss, [images]
 
 def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega, J,
-                g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, t_units, dtype):
+                g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, scale, t_units, dtype):
     """
     An chi-square loss function for EHT observations
 
@@ -301,6 +309,8 @@ def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega,
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
+    scale: float, 
+        Scaling factor for the loss
     t_units: astropy.units, 
         Time units for t_frames.
     dtype: 'str',
@@ -312,13 +322,9 @@ def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega,
         An array with loss values (the size is the number of GPUs)
     images: jnp.array
         An array of predicted images at different times (t_frames)
-        
-    Notes
-    -----
-    Currently only supports complex visibilities
     """
     images = image_plane_prediction(
-        params, predictor_fn, t_frames, coords, Omega, J,g, dtau, Sigma,
+        params, predictor_fn, t_frames, coords, Omega, J, g, dtau, Sigma,
         t_start_obs, t_geos, t_injection, rmin, rmax, t_units
     )
     
@@ -326,24 +332,33 @@ def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega,
     image_vectors = images.reshape(*images.shape[:-2], -1, 1)
     image_vectors = bhnerf.utils.expand_dims(image_vectors, A.ndim, axis=-3, use_jax=True)
     visibilities = jnp.squeeze(jnp.matmul(A, image_vectors), -1)
-    
     if dtype == 'vis':
         if visibilities.ndim != target.ndim: 
             raise AttributeError('visibilities (ndim={}) should have same dimensions as target (ndim={}) for dtype={}'.format(visibilities.ndim, target.ndim, dtype))
         chisq = jnp.sum((jnp.abs(visibilities - target)/sigma)**2)
+        
+    elif dtype == 'amp':
+        if visibilities.ndim != target.ndim: 
+            raise AttributeError('visibilities (ndim={}) should have same dimensions as target (ndim={}) for dtype={}'.format(visibilities.ndim, target.ndim, dtype))
+        chisq = jnp.sum(jnp.abs((jnp.abs(visibilities) - target)/sigma)**2)
+        
     elif dtype == 'cphase':
         if visibilities.ndim != target.ndim+1: 
             raise AttributeError('visibilities (ndim={}) should have +1 dimensions as target (ndim={}) for dtype={}'.format(visibilities.ndim, target.ndim, dtype))
         clphase_samples = jnp.angle(jnp.product(visibilities, axis=-2))
         chisq = jnp.sum((1.0 - jnp.cos(target-clphase_samples))/(sigma**2))
         
-    return chisq, [images]
+    else: 
+        raise AttributeError('eht dtype ({}) not supported'.format(dtype))
+        
+    return scale*chisq, [images]
 
-@functools.partial(jit, static_argnums=(1))
-def train_step_image(state, t_units, target, t_frames, coords, Omega, J, g, dtau, Sigma,
-                     t_start_obs, t_geos, t_injection, rmin, rmax):
+@functools.partial(jit, static_argnums=(1, 2))
+def gradient_step_image(state, t_units, dtype, target, t_frames, coords, Omega, J, g, dtau, Sigma,
+                        t_start_obs, t_geos, t_injection, rmin, rmax, scale):
     """
-    Training step function for fitting the image-plane directly
+    Gradient step function for fitting the image-plane directly
+    This function computed gradients and updates the state. 
     
     Parameters
     ----------
@@ -351,6 +366,8 @@ def train_step_image(state, t_units, target, t_frames, coords, Omega, J, g, dtau
         The training state holding the network parameters and apply_fn
     t_units: astropy.units, 
         Time units for t_frames.
+    dtype: 'str',
+        Datatype to compute the loss for ('full'/'lightcurve' etc..)
     target: array, 
         Target images to fit the model to. 
     t_frames: array, 
@@ -377,95 +394,29 @@ def train_step_image(state, t_units, target, t_frames, coords, Omega, J, g, dtau
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
-
+    scale: float, 
+        Scaling factor for the loss
+        
     Returns
     -------
     loss: jnp.array,
         An array with loss values (the size is the number of GPUs)
     images: jnp.array
         An array of predicted images at different times (t_frames)
-        
-    Notes
-    -----
-    Arguments for jax.pmap:
-        axis_name='batch',
-        in_axes=(0, None, 0, 0, None, None, None, None, None, None, None, None, None, None, None),
-        static_broadcasted_argnums=(1),
     """
     (loss, [images]), grads = jax.value_and_grad(loss_fn_image, argnums=(0), has_aux=True)(
         state.params, state.apply_fn, target, t_frames, coords, Omega, J, g, dtau, Sigma, 
-        t_start_obs, t_geos, t_injection, rmin, rmax, t_units)
+        t_start_obs, t_geos, t_injection, rmin, rmax, scale, t_units, dtype)
     grads = jax.lax.pmean(grads, axis_name='batch')
     state = state.apply_gradients(grads=grads)
     return loss, state, images
 
-@functools.partial(jit, static_argnums=(1))
-def test_step_image(state, t_units, target, t_frames, coords, Omega, J, g, dtau, Sigma, 
-                    t_start_obs, t_geos, t_injection, rmin, rmax):
-    """
-    Test step function for fitting the image-plane directly. 
-    This function is identical to train_step_image except does not compute gradients or 
-    updates the state
-    
-    Parameters
-    ----------
-    state: flax.training.train_state.TrainState, 
-        The training state holding the network parameters and apply_fn
-    t_units: astropy.units, 
-        Time units for t_frames.
-    target: array, 
-        Target images to fit the model to. 
-    t_frames: array, 
-        Array of time for each image frame
-    coords: list of arrays, 
-        For 3D emission coords=[x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
-        alpha, beta are image coordinates. These arrays contain the ray integration points
-    Omega: array, 
-        Angular velocity array sampled along the coords points
-    J: np.array(shape=(3,...)), 
-        Stokes vector scaling factors including parallel transport (I, Q, U)
-    g: array, 
-        doppler boosting factor, 
-    dtau: array, 
-        mino time differential
-    Sigma: array, 
-    t_start_obs: astropy.Quantity, default=None
-        Start time for observations, if None t_frames[0] is assumed to be start time.
-    t_geos: array, 
-        Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
-    t_injection: float, 
-        Time of hotspot injection in M units.
-    rmin: float, 
-        The minimum radius for recovery
-    rmax: float, 
-        The maximum radius for recovery
-
-    Returns
-    -------
-    loss: jnp.array,
-        An array with loss values (the size is the number of GPUs)
-    images: jnp.array
-        An array of predicted images at different times (t_frames)
-        
-    Notes
-    -----
-    Arguments for jax.pmap:
-        axis_name='batch',
-        in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None), 
-        static_broadcasted_argnums=(1),
-    """
-    loss, [images] = loss_fn_image(
-        state.params, state.apply_fn, target, t_frames, coords, Omega, J, g, dtau, Sigma, 
-        t_start_obs, t_geos, t_injection, rmin, rmax, t_units)
-    return loss, images
-
 @functools.partial(jit, static_argnums=(1, 2))
-def train_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, J, g, dtau, Sigma, t_start_obs, 
-                   t_geos, t_injection, rmin, rmax):
+def gradient_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, J, g, dtau, 
+                      Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, scale):
     """
-    Train step function for fitting eht observations
+    Gradient step function for fitting eht observations
     This function computed gradients and updates the state. 
-    Currently only supports complex visibilities.
     
     Parameters
     ----------
@@ -507,6 +458,8 @@ def train_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Om
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
+    scale: float, 
+        Scaling factor for the loss
         
     Returns
     -------
@@ -514,24 +467,72 @@ def train_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Om
         An array with loss values (the size is the number of GPUs)
     images: jnp.array
         An array of predicted images at different times (t_frames)
-        
-    Notes
-    -----
-    Arguments for jax.pmap:
-        axis_name='batch',
-        in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None), 
-        static_broadcasted_argnums=(1, 2))
     """
     (loss, [images]), grads = jax.value_and_grad(loss_fn_eht, argnums=(0), has_aux=True)(
         state.params, state.apply_fn, target, sigma, A, t_frames, coords, Omega, J, g, dtau, Sigma, 
-        t_start_obs, t_geos, t_injection, rmin, rmax, t_units, dtype)
+        t_start_obs, t_geos, t_injection, rmin, rmax, scale, t_units, dtype)
     grads = jax.lax.pmean(grads, axis_name='batch')
     state = state.apply_gradients(grads=grads)
     return loss, state, images
 
+@functools.partial(jit, static_argnums=(1))
+def test_step_image(state, t_units, target, t_frames, coords, Omega, J, g, dtau, Sigma, 
+                    t_start_obs, t_geos, t_injection, rmin, rmax, scale):
+    """
+    Test step function for fitting the image-plane directly. 
+    This function is identical to train_step_image except does not compute gradients or 
+    updates the state
+    
+    Parameters
+    ----------
+    state: flax.training.train_state.TrainState, 
+        The training state holding the network parameters and apply_fn
+    t_units: astropy.units, 
+        Time units for t_frames.
+    target: array, 
+        Target images to fit the model to. 
+    t_frames: array, 
+        Array of time for each image frame
+    coords: list of arrays, 
+        For 3D emission coords=[x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
+        alpha, beta are image coordinates. These arrays contain the ray integration points
+    Omega: array, 
+        Angular velocity array sampled along the coords points
+    J: np.array(shape=(3,...)), 
+        Stokes vector scaling factors including parallel transport (I, Q, U)
+    g: array, 
+        doppler boosting factor, 
+    dtau: array, 
+        mino time differential
+    Sigma: array, 
+    t_start_obs: astropy.Quantity, default=None
+        Start time for observations, if None t_frames[0] is assumed to be start time.
+    t_geos: array, 
+        Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
+    t_injection: float, 
+        Time of hotspot injection in M units.
+    rmin: float, 
+        The minimum radius for recovery
+    rmax: float, 
+        The maximum radius for recovery
+    scale: float, 
+        Scaling factor for the loss
+        
+    Returns
+    -------
+    loss: jnp.array,
+        An array with loss values (the size is the number of GPUs)
+    images: jnp.array
+        An array of predicted images at different times (t_frames)
+    """
+    loss, [images] = loss_fn_image(
+        state.params, state.apply_fn, target, t_frames, coords, Omega, J, g, dtau, Sigma, 
+        t_start_obs, t_geos, t_injection, rmin, rmax, scale, t_units, dtype)
+    return loss, images
+
 @functools.partial(jit, static_argnums=(1, 2))
 def test_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, J, g, dtau, Sigma, 
-                  t_start_obs, t_geos, t_injection, rmin, rmax):
+                  t_start_obs, t_geos, t_injection, rmin, rmax, scale):
     """
     Test step function for fitting eht observations
     This function is identical to train_step_image except does not compute gradients or 
@@ -575,6 +576,8 @@ def test_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Ome
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
+    scale: float, 
+        Scaling factor for the loss
         
     Returns
     -------
@@ -582,16 +585,9 @@ def test_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Ome
         An array with loss values (the size is the number of GPUs)
     images: jnp.array
         An array of predicted images at different times (t_frames)
-        
-    Notes
-    -----
-    Arguments for jax.pmap:
-        axis_name='batch',
-        in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None), 
-        static_broadcasted_argnums=(1, 2))
     """
     loss, [images] = loss_fn_eht(state.params, state.apply_fn, target, sigma, A, t_frames, coords, Omega, J, g, dtau, Sigma, 
-                                 t_start_obs, t_geos, t_injection, rmin, rmax, t_units, dtype)
+                                 t_start_obs, t_geos, t_injection, rmin, rmax, scale, t_units, dtype)
     return loss, images
     
     
