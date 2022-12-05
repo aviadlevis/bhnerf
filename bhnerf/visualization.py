@@ -166,10 +166,9 @@ def plot_geodesic_3D(data_array, geos, method='interact', max_r=10, figsize=(5,5
         # output = animation.FuncAnimation(fig, lambda pix: update(pix, vmin, vmax), 
         #                                 frames=geos.pix.size-1, interval=1e3 / fps)
     return output
-
-        
+       
 def animate_synced(movie, measurements, axes, t_dim='t', vmin=None, vmax=None, cmap='RdBu_r', add_ticks=True,
-                   add_colorbar=True, title=None, fps=10, output=None):
+                   add_colorbar=True, title=None, fps=10, output=None, bitrate=1e6):
 
     def animate_both(i):
         return animate_frame(i), animate_plot(i)
@@ -216,11 +215,12 @@ def animate_synced(movie, measurements, axes, t_dim='t', vmin=None, vmax=None, c
     anim = animation.FuncAnimation(fig, animate_both, frames=num_frames, interval=1e3 / fps)
 
     if output is not None:
-        anim.save(output, writer='imagemagick', fps=fps)
+        writer = animation.writers['ffmpeg'](fps=fps, bitrate=bitrate)
+        anim.save(output, writer=writer)
     return anim
 
 def animate_movies_synced(movie_list, axes, t_dim='t', vmin=None, vmax=None, cmaps='afmhot', add_ticks=False,
-                   add_colorbars=True, titles=None, fps=10, output=None, flipy=False):
+                   add_colorbars=True, titles=None, fps=10, output=None, flipy=False, bitrate=1e6):
     """
     Synchronous animation of multiple 3D xr.DataArray along a chosen dimension.
 
@@ -297,7 +297,8 @@ def animate_movies_synced(movie_list, axes, t_dim='t', vmin=None, vmax=None, cma
     anim = animation.FuncAnimation(fig, animate_frame, frames=num_frames, interval=1e3 / fps)
 
     if output is not None:
-        anim.save(output, writer='imagemagick', fps=fps)
+        writer = animation.writers['ffmpeg'](fps=fps, bitrate=bitrate)
+        anim.save(output, writer=writer)
     return anim
 
 @xr.register_dataarray_accessor("visualization")
@@ -352,7 +353,7 @@ class _VisualizationAccessor(object):
         interact(imshow_frame, frame=(0, num_frames-1));
 
     def animate(self, t_dim='t', ax=None, vmin=None, vmax=None, cmap='RdBu_r', add_ticks=True, add_colorbar=True,
-                fps=10, output=None):
+                fps=10, output=None, bitrate=1e6):
         """
         Animate a 3D xr.DataArray along a chosen dimension.
 
@@ -417,7 +418,8 @@ class _VisualizationAccessor(object):
         anim = animation.FuncAnimation(fig, animate_frame, frames=num_frames, interval=1e3 / fps)
 
         if output is not None:
-            anim.save(output, writer='imagemagick', fps=fps)
+            writer = animation.writers['ffmpeg'](fps=fps, bitrate=bitrate)
+            anim.save(output, writer=writer)
         return anim
 
 class VolumeVisualizer(object):
@@ -467,7 +469,7 @@ class VolumeVisualizer(object):
                                                   jnp.zeros_like(self._pts[...,-1:,:])], 
                                                  axis=2), axis=-1)
     
-    def render(self, emission, facewidth, jit=False, bh_radius=0.0, norm_const=1.0, linewidth=0.1, bh_albedo=[0,0,0], cmap='hot'):
+    def render(self, emission, facewidth, jit=False, bh_radius=0.0, linewidth=0.1, bh_albedo=[0,0,0], cmap='hot'):
         """
         Render an image of the 3D emission
         
@@ -481,8 +483,6 @@ class VolumeVisualizer(object):
         bh_radius: float, default=0.0
             Radius at which to draw a black hole (for visualization). 
             If bh_radius=0 then no black hole is drawn.
-        norm_const: float, default=1.0 
-            normalize (divide) by this constant) 
         facewidth: float, default=10.0 
             width of the enclosing cube face
         linewidth: float, default=0.1
@@ -498,7 +498,7 @@ class VolumeVisualizer(object):
         """
         if self._pts is None: 
             raise AttributeError('must set view before rendering')
-        emission = emission / norm_const
+    
         
         cm = plt.get_cmap('hot') 
         emission_cm = cm(emission)
@@ -670,3 +670,27 @@ def draw_bh(emission, pts, bh_radius, bh_albedo):
     emission = jnp.where(jnp.less(jnp.linalg.norm(pts, axis=-1, keepdims=True), bh_radius),
                     jnp.concatenate([bh_color, jnp.ones_like(emission[..., 3:])], axis=-1), emission)
     return emission
+
+
+def ipyvolume_3d(volume, fov, azimuth=0, elevation=-60, distance=2.5, level=[0, 0.2, 0.7], opacity=[0, 0.2, 0.3], controls=False):
+    
+    import ipyvolume as ipv
+    
+    if volume.ndim == 3:
+        ipv.figure()
+        ipv.view(azimuth, elevation, distance=distance)
+        ipv.volshow(volume, extent=[(-fov/2, fov/2)]*3, memorder='F', level=level, opacity=opacity, controls=controls)
+        ipv.show()
+        
+    elif volume.ndim == 4:
+        from ipywidgets import interact
+        import ipywidgets as widgets
+        @interact(t=widgets.IntSlider(min=0, max=volume.shape[0]-1, step=1, value=0))
+        def plot_vol(t):
+            ipv.figure()
+            ipv.view(azimuth, elevation, distance=distance)
+            ipv.volshow(volume[t], extent=[(-fov/2, fov/2)]*3, memorder='F', level=level, opacity=opacity, controls=controls)
+            ipv.show()
+            
+    else:
+        raise AttributeError('volume.ndim = {} not supported'.format(volume.ndim))

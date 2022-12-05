@@ -4,6 +4,7 @@ import functools
 import math
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+import math
 
 mse = lambda true, est: float(np.mean((true - est)**2))
 
@@ -216,3 +217,79 @@ def expand_dims(x, ndim, axis=0, use_jax=False):
     for i in range(ndim-_np.array(x).ndim):
         x = _np.expand_dims(x, axis=min(axis, _np.array(x).ndim))
     return x
+
+def expand_3d(movie, fov_z, H_r=0.05, std=0.2, std_clip=3, nz=64):
+    """
+    Expand a 2D movie into 3D (movie) with some H/r
+    
+    Parameters
+    ----------
+    movie: np.array,
+        2D movie (frames are in the first index)
+    fov_z: float, 
+        field of view (M) in z axis
+    H_r: float, default=0.05
+        tangent of expansion with increasing radius (Height/radius)
+    std: float, default=0.2
+        Standard deviation for height in Z axis
+    std_clip: float, default=3,
+        Clip values after this amount of stds in Z axis
+    nz: int, default=64,
+        The grid resulution in Z
+    
+    Returns
+    -------
+    emission: np.array,
+        3D movie with emission values
+    """
+    emission = movie.expand_dims(z=np.linspace(-fov_z/2, fov_z/2, nz), axis=-1)
+    H = H_r * np.sqrt(emission.x**2 + emission.y**2)
+    gaussian = np.exp(-0.5*(emission.z)**2/ H**2).transpose('y', 'x', 'z')
+    gaussian.where(gaussian > np.exp(-0.5 * std_clip ** 2)).fillna(0.0)
+    emission = emission * gaussian
+    return emission
+
+def next_power_of_two(x):
+    """
+    Find the next greatest power of two
+
+    Parameters
+    ----------
+    x: int,
+        Input integer
+
+    Returns
+    -------
+    y: int
+       Next greatest power of two
+    """
+    y = 2 ** (math.ceil(math.log(x, 2)))
+    return y
+
+def fft_transform(movies, fft_pad_factor=2):
+    """
+    Fast Fourier transform of one or several movies.
+    Fourier is done per each time slice on image dimensions
+
+    Parameters
+    ----------
+    fft_pad_factor: float, default=2
+        A padding factor for increased fft resolution.
+
+    Returns
+    -------
+    fft: array
+        An array with the transformed signal.
+    """
+    ny, nx = movies.shape[-2:]
+    npad = next_power_of_two(fft_pad_factor * np.max((nx, ny)))
+    padvalx1 = padvalx2 = int(np.floor((npad - nx) / 2.0))
+    padvaly1 = padvaly2 = int(np.floor((npad - ny) / 2.0))
+    padvalx2 += 1 if nx % 2 else 0
+    padvaly2 += 1 if ny % 2 else 0
+    pad_width = [(0,0)] * (movies.ndim - 2) + [(padvaly1, padvaly2), (padvalx1, padvalx2)]
+    padded_movies = np.pad(movies, pad_width, constant_values=0.0)
+
+    # Compute visibilities (Fourier transform) of the entire block
+    fft = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(padded_movies)))
+    return fft

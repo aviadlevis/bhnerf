@@ -174,7 +174,7 @@ def interpolate_coords(emission, coords):
     interpolated_data = scipy.ndimage.map_coordinates(emission, image_coords, order=1, cval=0.)
     return interpolated_data
 
-def image_plane_dynamics(emission_0, geos, Omega, t_frames, t_injection, J=1.0, t_start_obs=None, rot_axis=[0,0,1], M=consts.sgra_mass):
+def image_plane_dynamics(emission_0, geos, Omega, t_frames, t_injection, J=1.0, t_start_obs=None, slow_light=True, rot_axis=[0,0,1], M=consts.sgra_mass):
     """
     Compute the image-plane dynamics (movie) for a given initial emission and geodesics.
     
@@ -194,6 +194,8 @@ def image_plane_dynamics(emission_0, geos, Omega, t_frames, t_injection, J=1.0, 
         Stokes polarization factors on the geodesic grid. None means no magnetic fields (non-polarized emission).
     t_start_obs: astropy.Quantity, default=None
         Start time for observations, if None t_frames[0] is assumed to be start time.
+    slow_light: bool, default=True
+        Modeling the time it takes for the propogation of light.
     rot_axis: array, default=[0, 0, 1]
         Currently only equitorial plane rotation is supported
     M: astropy.Quantity, default=constants.sgra_mass,
@@ -204,27 +206,73 @@ def image_plane_dynamics(emission_0, geos, Omega, t_frames, t_injection, J=1.0, 
     images: np.array
         A movie array with image-plane frames. Polarization components are given along axis=1.
     """
+    t_geos = geos.t if slow_light else 0.0
     warped_coords = velocity_warp_coords(
         coords=[geos.x, geos.y, geos.z],
         Omega=Omega, 
         t_frames=t_frames, 
-        t_start_obs=t_frames[0] if t_start_obs is None else t_start_obs, 
-        t_geos=geos.t, 
+        t_start_obs=np.atleast_1d(t_frames)[0] if t_start_obs is None else t_start_obs, 
+        t_geos=t_geos, 
         t_injection=t_injection, 
         rot_axis=rot_axis, 
         M=M  
     )
-    emission = interpolate_coords(emission_0, warped_coords)
     umu = kgeo.azimuthal_velocity_vector(geos, Omega)
     g = kgeo.doppler_factor(geos, umu)
     
+    if emission_0.ndim == 3:
+        emission = interpolate_coords(emission_0, warped_coords)
+    
+    # If emission_0 is already a movie
+    elif emission_0.ndim == 4:
+        emission = []
+        for t in range(emission_0.shape[0]):
+            emission.append(interpolate_coords(emission_0[t], warped_coords))
+        emission = np.array(emission)
+        
     # Use magnetic fields for polarized synchrotron radiation
     if not jnp.isscalar(J):
-        J = utils.expand_dims(J, emission.ndim+1, 0, use_jax=True)
-        emission = J * utils.expand_dims(emission, emission.ndim+1, 1, use_jax=True)
+        J = utils.expand_dims(J, emission.ndim+1, 0)
+        emission = J * utils.expand_dims(emission, emission.ndim+1, 1)
         emission = np.squeeze(emission)
     images = kgeo.radiative_trasfer(emission, np.array(g), np.array(geos.dtau), np.array(geos.Sigma))
     return images
+
+def propogate_flatspace_emission(emission_0, Omega_3D, t_frames, rot_axis=[0,0,1], M=consts.sgra_mass):
+    """
+    Compute the 3D movie for a given initial emission in flat-space.
+    
+    Parameters
+    ----------
+    emission_0: np.array
+        3D array with emission values
+    Omega_3D: xr.DataArray
+        A dataarray specifying the keplerian velocity field in flat-space 3D coords (NOT GEODESICS)
+    t_frames: array, 
+        Array of time for each image frame with astropy.units
+    rot_axis: array, default=[0, 0, 1]
+        Currently only equitorial plane rotation is supported
+    M: astropy.Quantity, default=constants.sgra_mass,
+        Mass of the black hole used to convert frame times to space-time times in units of M
+        
+    Returns
+    -------
+    images: np.array
+        A movie array with image-plane frames. Polarization components are given along axis=1.
+    """
+    x, y, z = np.meshgrid(emission_0.x, emission_0.y, emission_0.z, indexing='ij')
+    warped_coords = velocity_warp_coords(
+        coords=[x, y, z],
+        Omega=Omega_3D,
+        t_frames=t_frames,
+        t_start_obs=np.atleast_1d(t_frames)[0], 
+        t_geos=0,
+        t_injection=0,
+        rot_axis=rot_axis,
+        M=M
+    )
+    emission_t = interpolate_coords(emission_0, warped_coords)
+    return emission_t
 
 def fill_unsupervised_emission(emission, coords, rmin=0, rmax=np.Inf, fill_value=0.0, use_jax=False):
     """
@@ -255,3 +303,22 @@ def fill_unsupervised_emission(emission, coords, rmin=0, rmax=np.Inf, fill_value
     emission = _np.where(r_sq < rmin**2, _np.full_like(emission, fill_value=fill_value), emission)
     emission = _np.where(r_sq > rmax**2, _np.full_like(emission, fill_value=fill_value), emission)
     return emission
+
+
+def grf_to_image_plane(grf, geos, Omega, J, alpha=2.0, height_std=0.275):
+    alpha = 2.0 
+    fov_M = float(geos.alpha[-1]-geos.alpha[0])
+    gaussian = utils.gaussian_xr([grf.y.size, grf.x.size], [0,0], std=height_std).data
+    movie = np.exp(alpha*grf) * gaussian
+    
+    # Expand the 2D grf into 3D
+    emission = utils.expand_3d(movie, fov_z=fov_M, H_r=0.075)
+    image_plane = image_plane_dynamics(emission, geos, Omega, 0.0, 0.0, J, slow_light=False)
+    return image_plane
+
+def normalize_stokes(movie, I_flux, P_flux):
+    flux = movie[:,0].sum(axis=(-1,-2)).mean()
+    dolp = np.sqrt(np.sum(movie[:,1:].sum(axis=(-1,-2))**2, axis=1)).mean()
+    movie[:,0]  *= I_flux / flux
+    movie[:,1:] *= P_flux / dolp
+    return movie

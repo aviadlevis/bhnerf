@@ -74,7 +74,7 @@ def run(runname, hparams, predictor, train_step, geos, Omega, rmax, t_injection,
         if emission_true is not None: writer.add_images('emission/true', bhnerf.utils.intensity_to_nchw(emission_true), global_step=0)
 
         for i in tqdm(range(init_step, init_step + hparams['num_iters']), desc='iteration'):
-            loss, state, images = train_step(state, batchsize=hparams['batchsize'])
+            loss, state, images = train_step(state, indices=train_step.args[0].sample(hparams['batchsize']))
 
             # Log the current state on TensorBoard
             writer.add_scalar('log_loss/train', np.log10(np.mean(loss)), global_step=i)
@@ -146,24 +146,20 @@ def loop_over_inclination(geos_base, inc_grid, b_consts, runname, hparams, predi
         runname_inc = runname + '.inc_{:.1f}'.format(np.rad2deg(inclination))
         run(runname_inc, hparams, predictor, train_step, geos, Omega, rmax, t_injection, J, emission_true, vis_res, log_period, hparams['num_iters'])
 
-def total_movie_loss(runname, hparams, predictor, test_step, geos, Omega, rmax, t_injection, batched_args, J=1.0, 
-                     return_frames=False):
+def total_movie_loss(checkpoint_dir, batchsize, predictor, train_step, geos, Omega, rmax, t_injection, J=1.0, return_frames=False):
     """
     This function chunks up the movie into frames which fit on GPUs and sums the total loss over all frames 
     
     Parameters
     ----------
-    runname: str, 
-        String used for logging and saving checkpoints.
-    hparams: dict, 
-        'num_iters': int, number of iterations, 
-        'lr_init': float, initial learning rate,
-        'lr_final': float, final learning rate, 
-        'batchsize': int, should be an integer factor of the number of GPUs used
+    checkpoint_dir: str, 
+        Path to directory with latest checkpoint
+    batchsize: int, 
+        batchsize should be an integer factor of the number of GPUs used
     predictor: flax.training.train_state.TrainState, 
         The training state holding the network parameters and apply_fn
-    test_step: TrainStep, 
-        A conatiner for parallel mapping of the training function
+    train_step: TrainStep, 
+        A conatiner for parallel mapping of the training/testing function
     geos: xr.Dataset
         A dataset specifying geodesics (ray trajectories) ending at the image plane.
     Omega: xr.DataArray
@@ -172,9 +168,6 @@ def total_movie_loss(runname, hparams, predictor, test_step, geos, Omega, rmax, 
         The maximum radius for recovery
     t_injection: float, 
         Time of hotspot injection in M units.
-    batched_args: BatchedTemporalArgs instance,
-        Arguments taken by the training_step function which should be batched along the first dimension. 
-        See BatchedTemporalArgs classmethods for more information.
     J: np.array(shape=(3,...)), default=1.0
         Stokes vector scaling factors including parallel transport (I, Q, U). J=1.0 gives non-polarized emission.
     return_frames: bool, default=False, 
@@ -185,16 +178,14 @@ def total_movie_loss(runname, hparams, predictor, test_step, geos, Omega, rmax, 
     total_loss: float,
         The total loss over all frames.
     """
-        
-    checkpoint_dir = os.path.join('../checkpoints', runname)
+    hparams = {'num_iters': 0, 'lr_init': 0, 'lr_final': 0, 'batchsize': 0}
     if not os.path.exists(checkpoint_dir): 
         raise AttributeError('checkpoint directory does not exist: {}'.format(checkpoint_dir))
-    rendering_args, non_jit_args, state, init_step = preprocessing(hparams, predictor, test_pstep, geos, Omega, rmax, t_injection, batched_args, J, checkpoint_dir)
+    state, init_step = train_step.preprocess(hparams, predictor, geos, Omega, rmax, t_injection, J, checkpoint_dir)
     rmin = geos.r.min().data
-    
+
     # Split times according to batchsize
-    batchsize = hparams['batchsize']
-    nt = batched_args.num_frames
+    nt = train_step.args[0].num_frames
     nt_tilde = nt - nt % batchsize
     indices = np.array_split(np.arange(0, nt_tilde), nt_tilde/batchsize)
     indices.append(np.arange(nt-nt % batchsize, nt))
@@ -203,10 +194,11 @@ def total_movie_loss(runname, hparams, predictor, test_step, geos, Omega, rmax, 
     frames, total_loss = [], 0.0
     for inds in indices:
         if (inds.size == 0): break
-        loss, images = test_step(state, *non_jit_args, *batched_args[inds], *rendering_args)
-        total_loss += float((batchsize // jax.device_count()) * loss.sum())
+        loss, state, images = train_step(state, inds, update_state=False)
+        total_loss += loss.sum()
+        
         if return_frames:
-            frames.append(images.reshape(-1, geos.alpha.size, geos.beta.size))
+            frames.append(images.reshape(-1, *images.shape[2:]))
             
     output = total_loss
     if return_frames:
@@ -216,17 +208,18 @@ def total_movie_loss(runname, hparams, predictor, test_step, geos, Omega, rmax, 
 
 class TrainStep(object):
     
-    def __init__(self, dtype, args, grad_pmap, scale):
+    def __init__(self, dtype, args, grad_pmap, test_pmap, scale):
     
         self.dtype = np.atleast_1d(dtype)
         self.args = np.atleast_1d(args)
         self.grad_pmap = np.atleast_1d(grad_pmap)
+        self.test_pmap = np.atleast_1d(test_pmap)
         self.scale = np.atleast_1d(scale)
         
         if np.any([arg.t_units != units.hr for arg in self.args]):
             raise AttributeError('only hr units supported')
             
-        assert self.dtype.size == self.args.size == \
+        assert self.dtype.size == self.args.size == self.test_pmap.size == \
             self.grad_pmap.size == self.scale.size, 'input list sizes are not equal'
         self.num_losses = self.dtype.size
                          
@@ -267,10 +260,11 @@ class TrainStep(object):
         state = flax.jax_utils.replicate(state)
         return state, init_step
 
-    def __call__(self, state, batchsize):
+    def __call__(self, state, indices, update_state=True):
         total_loss = 0.0
+        call_fn = self.grad_pmap if update_state == True else self.test_pmap
         for i in range(self.num_losses):
-            loss, state, images = self.grad_pmap[i](state, self.args[0].t_units, self.dtype[i], *self.args[i].sample(batchsize), *self.rendering_args, self.scale[i])
+            loss, state, images = call_fn[i](state, self.args[0].t_units, self.dtype[i], *self.args[i][indices], *self.rendering_args, self.scale[i])
             total_loss += loss
         return total_loss, state, images
     
@@ -278,11 +272,12 @@ class TrainStep(object):
         dtype = np.append(self.dtype, other.dtype)
         args = np.append(self.args, other.args)
         grad_pmap = np.append(self.grad_pmap, other.grad_pmap)
+        test_pmap = np.append(self.test_pmap, other.test_pmap)
         scale = np.append(self.scale, other.scale)
-        return TrainStep(dtype, args, grad_pmap, scale)
+        return TrainStep(dtype, args, grad_pmap, test_pmap, scale)
     
     @classmethod
-    def image(cls, t_frames, image_plane, scale=1.0, dtype='full'):
+    def image(cls, t_frames, target, sigma=1.0, scale=1.0, dtype='full'):
         """
         Construct a training step for image plane measurements
         
@@ -290,18 +285,26 @@ class TrainStep(object):
         ----------
         t_frames: array, 
             Array of time for each image frame with astropy.units. If no units are included defaults to Hours.
-        image_plane: np.array
-            A movie array with image-plane frames (first axis should have same length as t_frames)
-            For stokes concatenate movies along the second axis: np.stack([I, Q, U], axis=1)
+        target: np.array
+            Target: first axis should have same length as t_frames
+            For stokes concatenate along the second axis: np.stack([I, Q, U], axis=1)
+        sigma: array,
+            An array of standard deviations for each pixel
+        dtype: str, default='full',
+            Currently supports 'full' or 'lc' (lightcurve)
         """
-        args = TemporalBatchedArgs(t_frames, image_plane)
+        sigma = sigma * np.ones_like(target) if np.isscalar(sigma) else sigma
+        args = TemporalBatchedArgs(t_frames, [target, sigma])
         grad_pmap = jax.pmap(bhnerf.network.gradient_step_image,
                              axis_name='batch', 
-                             in_axes=(0, None, None, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None),
+                             in_axes=(0, None, None, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None),
                              static_broadcasted_argnums=(1, 2))
-        
-        return cls(dtype, args, grad_pmap, scale)
-        
+        test_pmap = jax.pmap(bhnerf.network.test_image,
+                     axis_name='batch', 
+                     in_axes=(0, None, None, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None),
+                     static_broadcasted_argnums=(1, 2))
+        return cls(dtype, args, grad_pmap, test_pmap, scale)
+    
     @classmethod
     def eht(cls, t_frames, obs, image_fov, image_size, chisqdata, pol='I', scale=1.0):
         """
@@ -344,9 +347,14 @@ class TrainStep(object):
         grad_pmap = jax.pmap(bhnerf.network.gradient_step_eht, 
                 axis_name='batch', 
                 in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None), 
-                static_broadcasted_argnums=(1, 2))   
+                static_broadcasted_argnums=(1, 2)) 
         
-        return cls(dtype, args, grad_pmap, scale)
+        test_pmap = jax.pmap(bhnerf.network.test_eht, 
+                axis_name='batch', 
+                in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None), 
+                static_broadcasted_argnums=(1, 2)) 
+        
+        return cls(dtype, args, grad_pmap, test_pmap, scale)
 
         
 class TemporalBatchedArgs(object):
@@ -362,7 +370,7 @@ class TemporalBatchedArgs(object):
 
     def sample(self, batchsize, replace=False):   
         batch = np.random.choice(range(self.num_frames), batchsize, replace=replace)
-        return self[batch]
+        return batch
     
     def __getitem__(self, key):
         batched_args = [shard(arg[key,...]) for arg in self.args]

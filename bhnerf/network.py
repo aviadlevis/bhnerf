@@ -153,7 +153,7 @@ class NeRF_Predictor(nn.Module):
         return emission
     
 def image_plane_prediction(params, predictor_fn, t_frames, coords, Omega, J,
-                     g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, t_units):
+                           g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, t_units):
     """
     Predict image pixels from NeRF emission values
 
@@ -206,7 +206,7 @@ def image_plane_prediction(params, predictor_fn, t_frames, coords, Omega, J,
     images = kgeo.radiative_trasfer(emission, g, dtau, Sigma, use_jax=True)
     return images
 
-def loss_fn_image(params, predictor_fn, target, t_frames, coords, Omega, J, g, dtau, 
+def loss_fn_image(params, predictor_fn, target, sigma, t_frames, coords, Omega, J, g, dtau, 
                   Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, scale, t_units, dtype):
     """
     An L2 loss function for image pixels
@@ -219,6 +219,8 @@ def loss_fn_image(params, predictor_fn, target, t_frames, coords, Omega, J, g, d
         A coordinate-based neural net for predicting the emission values as a continuous function
     target: array, 
         Target images to fit the model to. 
+    sigma: array,
+        An array of standard deviations for each pixel
     t_frames: array, 
         Array of time for each image frame
     coords: list of arrays, 
@@ -262,7 +264,10 @@ def loss_fn_image(params, predictor_fn, target, t_frames, coords, Omega, J, g, d
         t_start_obs, t_geos, t_injection, rmin, rmax, t_units
     )
     if dtype == 'full':
-        loss = jnp.sum(jnp.abs(images - target)**2)
+        loss = jnp.sum(jnp.abs((images - target)/sigma)**2)
+    elif dtype == 'lc':
+        lightcurve = images.sum(axis=(-1,-2))
+        loss = jnp.sum(jnp.abs((lightcurve - target)/sigma)**2)
     else:
         raise AttributeError('image dtype ({}) not supported'.format(dtype))
         
@@ -354,7 +359,7 @@ def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega,
     return scale*chisq, [images]
 
 @functools.partial(jit, static_argnums=(1, 2))
-def gradient_step_image(state, t_units, dtype, target, t_frames, coords, Omega, J, g, dtau, Sigma,
+def gradient_step_image(state, t_units, dtype, target, sigma, t_frames, coords, Omega, J, g, dtau, Sigma,
                         t_start_obs, t_geos, t_injection, rmin, rmax, scale):
     """
     Gradient step function for fitting the image-plane directly
@@ -367,9 +372,11 @@ def gradient_step_image(state, t_units, dtype, target, t_frames, coords, Omega, 
     t_units: astropy.units, 
         Time units for t_frames.
     dtype: 'str',
-        Datatype to compute the loss for ('full'/'lightcurve' etc..)
+        Datatype to compute the loss for ('full'/'lc' etc..)
     target: array, 
         Target images to fit the model to. 
+    sigma: array,
+        An array of standard deviations for each pixel
     t_frames: array, 
         Array of time for each image frame
     coords: list of arrays, 
@@ -405,7 +412,7 @@ def gradient_step_image(state, t_units, dtype, target, t_frames, coords, Omega, 
         An array of predicted images at different times (t_frames)
     """
     (loss, [images]), grads = jax.value_and_grad(loss_fn_image, argnums=(0), has_aux=True)(
-        state.params, state.apply_fn, target, t_frames, coords, Omega, J, g, dtau, Sigma, 
+        state.params, state.apply_fn, target, sigma, t_frames, coords, Omega, J, g, dtau, Sigma, 
         t_start_obs, t_geos, t_injection, rmin, rmax, scale, t_units, dtype)
     grads = jax.lax.pmean(grads, axis_name='batch')
     state = state.apply_gradients(grads=grads)
@@ -475,8 +482,8 @@ def gradient_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords,
     state = state.apply_gradients(grads=grads)
     return loss, state, images
 
-@functools.partial(jit, static_argnums=(1))
-def test_step_image(state, t_units, target, t_frames, coords, Omega, J, g, dtau, Sigma, 
+@functools.partial(jit, static_argnums=(1, 2))
+def test_image(state, t_units, dtype, target, sigma, t_frames, coords, Omega, J, g, dtau, Sigma, 
                     t_start_obs, t_geos, t_injection, rmin, rmax, scale):
     """
     Test step function for fitting the image-plane directly. 
@@ -489,8 +496,12 @@ def test_step_image(state, t_units, target, t_frames, coords, Omega, J, g, dtau,
         The training state holding the network parameters and apply_fn
     t_units: astropy.units, 
         Time units for t_frames.
+    dtype: 'str',
+        Datatype to compute the loss for ('full'/'lc' etc..)
     target: array, 
         Target images to fit the model to. 
+    sigma: array,
+        An array of standard deviations for each pixel
     t_frames: array, 
         Array of time for each image frame
     coords: list of arrays, 
@@ -526,13 +537,13 @@ def test_step_image(state, t_units, target, t_frames, coords, Omega, J, g, dtau,
         An array of predicted images at different times (t_frames)
     """
     loss, [images] = loss_fn_image(
-        state.params, state.apply_fn, target, t_frames, coords, Omega, J, g, dtau, Sigma, 
-        t_start_obs, t_geos, t_injection, rmin, rmax, scale, t_units, dtype)
-    return loss, images
+        state.params, state.apply_fn, target, sigma, t_frames, coords, Omega, J, g, dtau, Sigma, 
+        t_start_obs, t_geos, t_injection, rmin, rmax, scale, t_units, dtype)      
+    return loss, state, images
 
 @functools.partial(jit, static_argnums=(1, 2))
-def test_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, J, g, dtau, Sigma, 
-                  t_start_obs, t_geos, t_injection, rmin, rmax, scale):
+def test_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, J, g, dtau, Sigma, 
+             t_start_obs, t_geos, t_injection, rmin, rmax, scale):
     """
     Test step function for fitting eht observations
     This function is identical to train_step_image except does not compute gradients or 
@@ -588,23 +599,20 @@ def test_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Ome
     """
     loss, [images] = loss_fn_eht(state.params, state.apply_fn, target, sigma, A, t_frames, coords, Omega, J, g, dtau, Sigma, 
                                  t_start_obs, t_geos, t_injection, rmin, rmax, scale, t_units, dtype)
-    return loss, images
-    
-    
+    return loss, state, images
+       
 def sample_3d_grid(apply_fn, params, rmin=0.0, rmax=np.inf, fov=None, coords=None, resolution=64): 
     """
     Parameters
     ----------
-    t_frames: array, 
-        Array of time for each volume
-    t_start: astropy.Quantity, default=None
-        Start time for observations.
+    apply_fn: nn.Module
+        A coordinate-based neural net for predicting the emission values as a continuous function
+    params: dict, 
+        A dictionary with network parameters (from state.params)
     rmin: float, default=0
         Zero values at radii < rmin
     rmax: float, default=np.inf
         Zero values at radii > rmax,
-    Omega: array or float, default=0.0 
-        Angular velocity array sampled along the coords. If initial time is sampled Omega has no effect and could be 0.0.
     fov: float, default=None
         Field of view. If None then coords need to be provided.
     coords: array(shape=(3,npoints)), optional, 

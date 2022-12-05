@@ -205,3 +205,15 @@ def padded_obs(obs, field, fill_value=np.nan):
     for i, obsdata in enumerate(obslist):
         output[i, :len(obsdata[field])] = obsdata[field]
     return output
+
+def stokes_array_to_ehtim(movie, times, psize,
+                          ra=17.761121055553343, dec=-29.00784305556, 
+                          rf=226191789062.5, mjd=57850):
+    if movie.ndim != 4:
+        raise AttributeError('movie ndim={} not supported'.format(movie.ndim))
+    
+    movie_ehtim = eh.movie.Movie(movie[:, 0], np.array(times), psize, ra, dec, rf, mjd=mjd)
+    poltypes = ['I', 'Q', 'U', 'V']
+    for i in range(1, movie.shape[1]):
+        movie_ehtim.add_pol_movie(movie[:, i], poltypes[i])
+    return movie_ehtim
