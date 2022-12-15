@@ -442,7 +442,7 @@ class VolumeVisualizer(object):
         self.focal = .5 * width / jnp.tan(.5 * 0.7)
         self._pts = None
         
-    def set_view(self, radius, azimuth, zenith, up=np.array([0., 0., 1.])):
+    def set_view(self, radius, azimuth, zenith, up=np.array([0., 0., 1.]), near=15., far=35.):
         """
         Set camera view geometry
         
@@ -463,11 +463,11 @@ class VolumeVisualizer(object):
         self._viewmatrix = self.viewmatrix(camorigin, up, camorigin)
         rays_o, rays_d = self.generate_rays(
             self._viewmatrix, self.width, self.height, self.focal)
-        self._pts = self.sample_along_rays(rays_o, rays_d, 15., 35., self.samples)
+        self._pts = self.sample_along_rays(rays_o, rays_d, near, far, self.samples)
         self.x, self.y, self.z = self._pts[...,0], self._pts[...,1], self._pts[...,2]
         self.d = jnp.linalg.norm(jnp.concatenate([jnp.diff(self._pts, axis=2), 
                                                   jnp.zeros_like(self._pts[...,-1:,:])], 
-                                                 axis=2), axis=-1)
+                                                  axis=2), axis=-1)
     
     def render(self, emission, facewidth, jit=False, bh_radius=0.0, linewidth=0.1, bh_albedo=[0,0,0], cmap='hot'):
         """
@@ -513,7 +513,7 @@ class VolumeVisualizer(object):
             emission_cube = draw_cube(emission_cm, self._pts, facewidth, linewidth)
             if bh_radius > 0:
                 emission_cube = draw_bh(emission_cube, self._pts, bh_radius, bh_albedo)
-        rendering = alpha_composite(emission_cube, self.d, self._pts, bh_radius)
+        rendering = alpha_composite(emission_cube, self.d, self._pts, bh_radius, facewidth / 2. - linewidth)
         return rendering
     
     def viewmatrix(self, lookdir, up, position):
@@ -551,7 +551,7 @@ class VolumeVisualizer(object):
         coords = None if self._pts is None else jnp.moveaxis(self._pts, -1, 0)
         return coords
 
-def alpha_composite(emission, dists, pts, bh_rad, inside_halfwidth=4.5):
+def alpha_composite(emission, dists, pts, bh_rad, inside_halfwidth=7.5):
     emission = np.clip(emission, 0., 1.)
     color = emission[..., :-1] * dists[0, ..., None]
     alpha = emission[..., -1:] 
@@ -560,38 +560,37 @@ def alpha_composite(emission, dists, pts, bh_rad, inside_halfwidth=4.5):
     inside = np.where(np.less(np.amax(np.abs(pts), axis=-1), inside_halfwidth), 
                       np.ones_like(pts[..., 0]),
                       np.zeros_like(pts[..., 0]))
-    
+
     # masks for points outside black hole
     bh = np.where(np.greater(np.linalg.norm(pts, axis=-1), bh_rad),
                   np.ones_like(pts[..., 0]),
                   np.zeros_like(pts[..., 0]))
-    
+
     combined_mask = np.logical_and(inside, bh)
-    
-    
+
+
     rendering = np.zeros_like(color[:, :, 0, :])
     acc = np.zeros_like(color[:, :, 0, 0])
     outside_acc = np.zeros_like(color[:, :, 0, 0])
     for i in range(alpha.shape[-2]):
         ind = alpha.shape[-2] - i - 1
-        
+
         # if pixels inside cube and outside black hole, don't alpha composite
         rendering = rendering + combined_mask[..., ind, None] * color[..., ind, :]
-        
+
         # else, alpha composite      
         outside_alpha = alpha[..., ind, :] * (1. - combined_mask[..., ind, None])
         rendering = rendering * (1. - outside_alpha) + color[..., ind, :] * outside_alpha 
-        
+
         acc = alpha[..., ind, 0] + (1. - alpha[..., ind, 0]) * acc
         outside_acc = outside_alpha[..., 0] + (1. - outside_alpha[..., 0]) * outside_acc
-        
+
     rendering += np.array([1., 1., 1.])[None, None, :] * (1. - acc[..., None])
     return rendering
 
 @jax.jit
 def draw_cube_jit(emission_cm, pts, facewidth, linewidth):
-    
-    linecolor = jnp.array([0.0, 0.0, 0.0, 1000.0])
+    linecolor = jnp.array([0.0, 0.0, 0.0, 1e6])
     vertices = jnp.array([[-facewidth/2., -facewidth/2., -facewidth/2.],
                         [facewidth/2., -facewidth/2., -facewidth/2.],
                         [-facewidth/2., facewidth/2., -facewidth/2.],
@@ -606,6 +605,10 @@ def draw_cube_jit(emission_cm, pts, facewidth, linewidth):
                       [0., 1., 0.],
                       [0., 0., -1.],
                       [0., 0., 1.]])
+    
+    # [nverts, ndirs, npts, 3]
+#     line_seg_pts = vertices[:, None, None, :] + jnp.linspace(0.0, facewidth, 64)[None, None, :, None] * dirs[None, :, None, :]
+#     print('test:', line_seg_pts.shape, pts.shape)
 
     for i in range(vertices.shape[0]):
 
@@ -615,14 +618,15 @@ def draw_cube_jit(emission_cm, pts, facewidth, linewidth):
 
             for k in range(line_seg_pts.shape[0]):
                 dists = jnp.linalg.norm(pts - jnp.broadcast_to(line_seg_pts[k, None, None, None, :], pts.shape), axis=-1)
-                emission_cm += linecolor[None, None, None, :] * jnp.exp(-1. * dists / linewidth ** 2)[..., None]
+                update = linecolor[None, None, None, :] * jnp.exp(-1. * dists / linewidth ** 2)[..., None]
+                emission_cm += update
 
     out = jnp.where(jnp.greater(jnp.broadcast_to(jnp.amax(jnp.abs(pts), axis=-1, keepdims=True), emission_cm.shape), 
                                 facewidth/2. + linewidth), jnp.zeros_like(emission_cm), emission_cm)
     return out
 
 def draw_cube(emission_cm, pts, facewidth, linewidth):
-    linecolor = jnp.array([0.0, 0.0, 0.0, 1000.0])
+    linecolor = jnp.array([0.0, 0.0, 0.0, 1e6])
     vertices = jnp.array([[-facewidth/2., -facewidth/2., -facewidth/2.],
                         [facewidth/2., -facewidth/2., -facewidth/2.],
                         [-facewidth/2., facewidth/2., -facewidth/2.],
@@ -637,6 +641,10 @@ def draw_cube(emission_cm, pts, facewidth, linewidth):
                       [0., 1., 0.],
                       [0., 0., -1.],
                       [0., 0., 1.]])
+    
+    # [nverts, ndirs, npts, 3]
+#     line_seg_pts = vertices[:, None, None, :] + jnp.linspace(0.0, facewidth, 64)[None, None, :, None] * dirs[None, :, None, :]
+#     print('test:', line_seg_pts.shape, pts.shape)
 
     for i in range(vertices.shape[0]):
 
@@ -646,7 +654,8 @@ def draw_cube(emission_cm, pts, facewidth, linewidth):
 
             for k in range(line_seg_pts.shape[0]):
                 dists = jnp.linalg.norm(pts - jnp.broadcast_to(line_seg_pts[k, None, None, None, :], pts.shape), axis=-1)
-                emission_cm += linecolor[None, None, None, :] * jnp.exp(-1. * dists / linewidth ** 2)[..., None]
+                update = linecolor[None, None, None, :] * jnp.exp(-1. * dists / linewidth ** 2)[..., None]
+                emission_cm += update
 
     out = jnp.where(jnp.greater(jnp.broadcast_to(jnp.amax(jnp.abs(pts), axis=-1, keepdims=True), emission_cm.shape), 
                                 facewidth/2. + linewidth), jnp.zeros_like(emission_cm), emission_cm)
