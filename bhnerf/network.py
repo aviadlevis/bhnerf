@@ -8,6 +8,8 @@ import functools
 import bhnerf
 from bhnerf import kgeo
 from jax import jit
+from flax.training import train_state, checkpoints
+import optax
 
 safe_sin = lambda x: jnp.sin(x % (100 * jnp.pi))
 
@@ -104,6 +106,37 @@ class NeRF_Predictor(nn.Module):
     activation: Callable[..., Any] = nn.relu
     out_channel: int = 1
     do_skip: bool = True
+    
+    def init_params(self, raytracing_args, seed=1):
+        params = self.init(jax.random.PRNGKey(seed), 
+                           raytracing_args['t_start_obs'], 
+                           raytracing_args['t_start_obs'].unit, 
+                           raytracing_args['coords'], 
+                           raytracing_args['Omega'], 
+                           raytracing_args['t_start_obs'], 
+                           raytracing_args['t_geos'], 
+                           raytracing_args['t_injection'])['params']
+        return params.unfreeze() # TODO(pratul): this unfreeze feels sketchy
+
+    def init_state(self, params, num_iters=5000, lr_init=1e-4, lr_final=1e-6, lr_inject=None, checkpoint_dir=''):
+        
+        lr = optax.polynomial_schedule(lr_init, lr_final, 1, num_iters)
+        tx = optax.adam(learning_rate=lr)
+        
+        if lr_inject:
+            tx = optax.chain(
+                optax.masked(optax.adam(learning_rate=lr_inject), mask=flattened_traversal(lambda path, _: path[-1] == 't_injection')),
+                optax.masked(tx, mask=flattened_traversal(lambda path, _: path[-1] != 't_injection')),
+            )
+            
+        state = train_state.TrainState.create(apply_fn=self.apply, params=params, tx=tx)  
+               
+        # Restore saved checkpoint
+        state = checkpoints.restore_checkpoint(checkpoint_dir, state)
+
+        # Replicate state for multiple gpus
+        state = flax.jax_utils.replicate(state)
+        return state
     
     @nn.compact
     def __call__(self, t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection):
@@ -655,3 +688,54 @@ def load_checkpoint(path, predictor):
     from flax.training import checkpoints
     state = checkpoints.restore_checkpoint(path, None)
     return state
+
+def raytracing_args(geos, Omega, t_injection, t_start_obs, rmax, J=1.0):
+    """
+    Return a list (ordered) with the ray tracing (non-optimized) arguments . 
+    
+    Parameters
+    ----------
+    geos: xr.Dataset
+        A dataset specifying geodesics (ray trajectories) ending at the image plane.
+    Omega: xr.DataArray
+        A dataarray specifying the keplerian velocity field
+    t_injection: float, 
+        Time of hotspot injection in M units.
+    t_start_obs: astropy.Quantity, 
+        Start time for observations
+    rmax: float, 
+        The maximum radius for recovery
+    J: np.array(shape=(3,...)), default=1.0
+        Stokes vector scaling factors including parallel transport (I, Q, U). J=1.0 gives non-polarized emission.
+        
+    Returns
+    -------
+    raytracing_args: list.
+        List of ray-tracing arguments (non-optimized)
+    """
+    from collections import OrderedDict
+    
+    coords = jnp.array([geos.x, geos.y, geos.z])
+    umu = kgeo.azimuthal_velocity_vector(geos, Omega)
+    g = jnp.array(kgeo.doppler_factor(geos, umu))
+    Omega = jnp.array(Omega)
+    dtau = jnp.array(geos.dtau)
+    Sigma = jnp.array(geos.Sigma)
+    t_geos = jnp.array(geos.t)
+    rmin = geos.r.min().data
+
+    raytracing_args = OrderedDict({
+        'coords': coords, 
+        'Omega': Omega, 
+        'J': J, 
+        'g': g, 
+        'dtau': dtau, 
+        'Sigma': Sigma, 
+        't_start_obs': t_start_obs, 
+        't_geos': t_geos, 
+        't_injection': t_injection, 
+        'rmin': rmin, 
+        'rm': rmax
+    })
+
+    return raytracing_args

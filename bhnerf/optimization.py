@@ -3,12 +3,11 @@ import jax, flax
 from jax import numpy as jnp
 import bhnerf
 from bhnerf import kgeo
-import optax
 import os
-from flax.training import checkpoints
 from astropy import units   
-    
-def run(runname, hparams, predictor, train_step, geos, Omega, rmax, t_injection, J=1.0, emission_true=None, vis_res=64, log_period=100, save_period=1000):
+from flax.training import checkpoints
+
+def run(runname, batchsize, num_iters, state, train_step, raytracing_args, rmin, rmax, emission_true=None, vis_res=64, log_period=100, save_period=1000):
     """
     Run a gradient descent optimization over the network parameters (3D emission) 
     
@@ -16,25 +15,20 @@ def run(runname, hparams, predictor, train_step, geos, Omega, rmax, t_injection,
     ----------
     runname: str, 
         String used for logging and saving checkpoints.
-    hparams: dict, 
-        'num_iters': int, number of iterations, 
-        'lr_init': float, initial learning rate,
-        'lr_final': float, final learning rate, 
-        'batchsize': int, should be an integer factor of the number of GPUs used
-    predictor: flax.training.train_state.TrainState, 
+    num_iters: int, 
+        number of iterations, 
+    batchsize: int, 
+        should be an integer factor of the number of GPUs used
+    state: flax.training.train_state.TrainState, 
         The training state holding the network parameters and apply_fn
     train_step: TrainStep, 
         A conatiner for parallel mapping of the training function
-    geos: xr.Dataset
-        A dataset specifying geodesics (ray trajectories) ending at the image plane.
-    Omega: xr.DataArray
-        A dataarray specifying the keplerian velocity field
+    raytracing_args: OrderedDict, 
+        dictionary with arguments used for ray tracing
+    rmin: float, 
+        The minim radius for visualization
     rmax: float, 
         The maximum radius for recovery
-    t_injection: float, 
-        Time of hotspot injection in M units.
-    J: np.array(shape=(3,...)), default=1.0
-        Stokes vector scaling factors including parallel transport (I, Q, U). J=1.0 gives non-polarized emission.
     emission_true: array, 
         A ground-truth array of 3D emission for evalutation metrics 
     vis_res: int, default=64
@@ -67,27 +61,26 @@ def run(runname, hparams, predictor, train_step, geos, Omega, rmax, t_injection,
         grid_1d = np.linspace(-rmax, rmax, vis_res)
         vis_coords = np.array(np.meshgrid(grid_1d, grid_1d, grid_1d, indexing='ij'))
 
-    state, init_step = train_step.preprocess(hparams, predictor, geos, Omega, rmax, t_injection, J, checkpoint_dir)
-    rmin = geos.r.min().data
-    
+    init_step = flax.jax_utils.unreplicate(state.step) + 1
     with SummaryWriter(logdir=logdir) as writer:
         if emission_true is not None: writer.add_images('emission/true', bhnerf.utils.intensity_to_nchw(emission_true), global_step=0)
 
-        for i in tqdm(range(init_step, init_step + hparams['num_iters']), desc='iteration'):
-            loss, state, images = train_step(state, indices=train_step.args[0].sample(hparams['batchsize']))
+        for i in tqdm(range(init_step, init_step + num_iters + 1), desc='iteration'):
+            batch_indices = train_step.args[0].sample(batchsize)
+            loss, state, images = train_step(state, raytracing_args, indices=batch_indices)
 
             # Log the current state on TensorBoard
             writer.add_scalar('log_loss/train', np.log10(np.mean(loss)), global_step=i)
-            if (i == 1) or ((i % log_period) == 0) or (i ==  init_step + hparams['num_iters']):
+            if (i == 1) or ((i % log_period) == 0) or (i ==  init_step + num_iters):
                 emission_grid = bhnerf.network.sample_3d_grid(state.apply_fn, state.params, rmin, rmax, coords=vis_coords)
                 writer.add_images('emission/estimate', bhnerf.utils.intensity_to_nchw(emission_grid), global_step=i)
-                if 'lr_inject' in hparams.keys(): writer.add_scalar('t_injection', float(current_state.params['t_injection']), global_step=i)
+                # if 'lr_inject' in hparams.keys(): writer.add_scalar('t_injection', float(current_state.params['t_injection']), global_step=i)
                 if emission_true is not None:
                     writer.add_scalar('emission/mse', bhnerf.utils.mse(emission_true.data, emission_grid), global_step=i)
                     writer.add_scalar('emission/psnr', bhnerf.utils.psnr(emission_true.data, emission_grid), global_step=i)
 
             # Save checkpoints occasionally
-            if np.isscalar(save_period) and ((i % save_period == 0) or (i ==  init_step + hparams['num_iters'])):
+            if np.isscalar(save_period) and ((i % save_period == 0) or (i ==  init_step + num_iters)):
                 current_state = jax.device_get(flax.jax_utils.unreplicate(state))
                 checkpoints.save_checkpoint(checkpoint_dir, current_state, int(i), keep=5)
     return current_state
@@ -146,7 +139,7 @@ def loop_over_inclination(geos_base, inc_grid, b_consts, runname, hparams, predi
         runname_inc = runname + '.inc_{:.1f}'.format(np.rad2deg(inclination))
         run(runname_inc, hparams, predictor, train_step, geos, Omega, rmax, t_injection, J, emission_true, vis_res, log_period, hparams['num_iters'])
 
-def total_movie_loss(checkpoint_dir, batchsize, predictor, train_step, geos, Omega, rmax, t_injection, J=1.0, return_frames=False):
+def total_movie_loss(checkpoint_dir, batchsize, state, train_step, raytracing_args, rmax, return_frames=False):
     """
     This function chunks up the movie into frames which fit on GPUs and sums the total loss over all frames 
     
@@ -156,20 +149,14 @@ def total_movie_loss(checkpoint_dir, batchsize, predictor, train_step, geos, Ome
         Path to directory with latest checkpoint
     batchsize: int, 
         batchsize should be an integer factor of the number of GPUs used
-    predictor: flax.training.train_state.TrainState, 
+    state: flax.training.train_state.TrainState, 
         The training state holding the network parameters and apply_fn
     train_step: TrainStep, 
         A conatiner for parallel mapping of the training/testing function
-    geos: xr.Dataset
-        A dataset specifying geodesics (ray trajectories) ending at the image plane.
-    Omega: xr.DataArray
-        A dataarray specifying the keplerian velocity field
+    raytracing_args: OrderedDict, 
+        dictionary with arguments used for ray tracing
     rmax: float, 
         The maximum radius for recovery
-    t_injection: float, 
-        Time of hotspot injection in M units.
-    J: np.array(shape=(3,...)), default=1.0
-        Stokes vector scaling factors including parallel transport (I, Q, U). J=1.0 gives non-polarized emission.
     return_frames: bool, default=False, 
         Return the estimated movie frames
 
@@ -178,23 +165,26 @@ def total_movie_loss(checkpoint_dir, batchsize, predictor, train_step, geos, Ome
     total_loss: float,
         The total loss over all frames.
     """
-    hparams = {'num_iters': 0, 'lr_init': 0, 'lr_final': 0, 'batchsize': 0}
     if not os.path.exists(checkpoint_dir): 
         raise AttributeError('checkpoint directory does not exist: {}'.format(checkpoint_dir))
-    state, init_step = train_step.preprocess(hparams, predictor, geos, Omega, rmax, t_injection, J, checkpoint_dir)
-    rmin = geos.r.min().data
-
-    # Split times according to batchsize
+    
+    # Split times according to batchsize and number of devices
     nt = train_step.args[0].num_frames
+    
+    if nt % jax.device_count():
+        raise AttributeError('batch size should be an integer multiplication of the device number')
+        
     nt_tilde = nt - nt % batchsize
     indices = np.array_split(np.arange(0, nt_tilde), nt_tilde/batchsize)
-    indices.append(np.arange(nt-nt % batchsize, nt))
+
+    nt_tilde1 = int(jax.device_count() * np.ceil(nt/jax.device_count()))
+    indices.append(np.arange(nt_tilde, nt_tilde1) % nt)
 
     # Aggregate loss over all frames
     frames, total_loss = [], 0.0
     for inds in indices:
         if (inds.size == 0): break
-        loss, state, images = train_step(state, inds, update_state=False)
+        loss, state, images = train_step(state, raytracing_args, inds, update_state=False)
         total_loss += loss.sum()
         
         if return_frames:
@@ -202,9 +192,10 @@ def total_movie_loss(checkpoint_dir, batchsize, predictor, train_step, geos, Ome
             
     output = total_loss
     if return_frames:
-        output = (total_loss, np.concatenate(frames))
+        output = (total_loss, np.concatenate(frames[:nt]))
         
     return output
+
 
 class TrainStep(object):
     
@@ -223,48 +214,12 @@ class TrainStep(object):
             self.grad_pmap.size == self.scale.size, 'input list sizes are not equal'
         self.num_losses = self.dtype.size
                          
-    def preprocess(self, hparams, predictor, geos, Omega, rmax, t_injection, J, checkpoint_dir):
-        
-        from flax.training import train_state
-        
-        # Image rendering arguments
-        t_units = self.args[0].t_units
-        coords = jnp.array([geos.x, geos.y, geos.z])
-        umu = kgeo.azimuthal_velocity_vector(geos, Omega)
-        g = jnp.array(kgeo.doppler_factor(geos, umu))
-        Omega = jnp.array(Omega)
-        dtau = jnp.array(geos.dtau)
-        Sigma = jnp.array(geos.Sigma)
-        t_start_obs = self.args[0].t_start_obs
-        t_geos = jnp.array(geos.t)
-        rmin = geos.r.min().data
-        
-        self.rendering_args = [coords, Omega, J, g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax]
-        
-        params = predictor.init(jax.random.PRNGKey(1), t_start_obs, t_units, coords, Omega, t_start_obs, t_geos, t_injection)['params']
-        tx = optax.adam(learning_rate=optax.polynomial_schedule(hparams['lr_init'], hparams['lr_final'], 1, hparams['num_iters']))
 
-        if 'lr_inject' in hparams.keys():
-            tx = optax.chain(
-                optax.masked(optax.adam(learning_rate=hparams['lr_inject']), mask=flattened_traversal(lambda path, _: path[-1] == 't_injection')),
-                optax.masked(tx, mask=flattened_traversal(lambda path, _: path[-1] != 't_injection')),
-            )
-
-        state = train_state.TrainState.create(apply_fn=predictor.apply, params=params.unfreeze(), tx=tx)  # TODO(pratul): this unfreeze feels sketchy
-
-        # Restore saved checkpoint
-        state = checkpoints.restore_checkpoint(checkpoint_dir, state)
-        init_step = 1 + state.step
-
-        # Replicate state for multiple gpus
-        state = flax.jax_utils.replicate(state)
-        return state, init_step
-
-    def __call__(self, state, indices, update_state=True):
+    def __call__(self, state, raytracing_args, indices, update_state=True):
         total_loss = 0.0
         call_fn = self.grad_pmap if update_state == True else self.test_pmap
         for i in range(self.num_losses):
-            loss, state, images = call_fn[i](state, self.args[0].t_units, self.dtype[i], *self.args[i][indices], *self.rendering_args, self.scale[i])
+            loss, state, images = call_fn[i](state, self.t_units, self.dtype[i], *self.args[i][indices], *raytracing_args.values(), self.scale[i])
             total_loss += loss
         return total_loss, state, images
     
@@ -356,6 +311,9 @@ class TrainStep(object):
         
         return cls(dtype, args, grad_pmap, test_pmap, scale)
 
+    @property
+    def t_units(self):
+        return self.args[0].t_units
         
 class TemporalBatchedArgs(object):
     

@@ -377,7 +377,7 @@ def zamo_frame_velocity(geos, beta, chi):
     umu = xr.concat([ut, ur, uth, uph], dim='mu', coords='minimal')
     return umu
 
-def parallel_transport(geos, umu, g, b, Q_factor=0.2, spectral_index=1):
+def parallel_transport(geos, umu, g, b, Q_frac=0.2, V_frac=0.1, spectral_index=1):
     """
     Parallel transport stokes vector J = [I, Q, U] to the observer screen. 
     Locally emitted polarization has U=0 (before paralell transport).
@@ -392,21 +392,24 @@ def parallel_transport(geos, umu, g, b, Q_factor=0.2, spectral_index=1):
         doppler boosting factor.
     b: xr.DataArray,
         Spherical-coordinate magnetic field sampled along the geodesics. component dim='mu'.
-    Q_factor: float, default=0.2, 
-        Scaling of Q with respect to I. Q_factor < 1.0
+    Q_frac: float, default=0.2, 
+        Scaling of Q with respect to I. Q_frac < 1.0
     spectral_index: int, default=1,
         Spectral index used for EHT frequencies.
         
     Returns
     -------
-    J: np.array(shape=(3,...)),
-        Stokes vector scaling factors including parallel transport (I, Q, U)
+    J: np.array(shape=(4,...)),
+        Stokes vector scaling factors including parallel transport of linear polarization (I, Q, U, V)
     
     Notes
     -----
-    Currently doesnt support V component
+    V scaling for power-law distributions. 
+    Eqs. A38-A40 of https://arxiv.org/pdf/1602.03184.pdf
+    \alpha = p/2 - 1/2
+    \nu_P = constant * |B| * \sin\theta_B
     """
-    if Q_factor > 1.0 or Q_factor < 0.0: raise AttributeError('Q_factor should be in [0,1]')
+    if Q_frac > 1.0 or Q_frac < 0.0: raise AttributeError('Q_frac should be in [0,1]')
         
     # Compute f (EVPA) in local fluid frame
     # Compute local cross product of wave vector with the magnetic field
@@ -426,12 +429,14 @@ def parallel_transport(geos, umu, g, b, Q_factor=0.2, spectral_index=1):
     # Compute emissivity scalings which depend on:
     #    - the magnetic field magnitude and pitch angle: b_mag, sin(theta_b)
     #    - doppler factor: g. 
-    #    - spectral index
+    #    - spectral index: alpha
     b_mag = np.array(np.sqrt((b**2).sum('mu')))
     sin_th_b = np.sqrt((f_local**2).sum(axis=-1)) / np.sqrt((k_mu_prime**2).sum(axis=-1))
+    cot_th_b = np.sqrt(1 - sin_th_b**2) / sin_th_b
     I = g**spectral_index * b_mag**(spectral_index+1) * sin_th_b**(spectral_index+1)
-    Q = Q_factor * I
+    Q = Q_frac * I
     U = np.zeros_like(Q)
+    V = V_frac * g**(-spectral_index-1/2) * b_mag**(spectral_index+3/2) * sin_th_b**(spectral_index+3/2) * cot_th_b
     emitted_qu = np.stack([Q, U], axis=-1)[...,None]
     
     # Compute Penrose-Walker complex constant kappa and extract the rotation angle chi2 for parallel transport to observer screen
@@ -449,10 +454,11 @@ def parallel_transport(geos, umu, g, b, Q_factor=0.2, spectral_index=1):
     ]), [0, 1], [-2, -1])
     J_i = np.array(I)[None,...]
     J_qu = np.moveaxis(np.squeeze(np.matmul(rot_matrix, emitted_qu), axis=-1), -1, 0)
-    J = np.concatenate([J_i, J_qu])
+    J_v = np.array(V)[None,...]
+    J = np.concatenate([J_i, J_qu, J_v])
     return J
 
-def parallel_transport_zamo(geos, beta_v, chi, g, b, Q_factor=0.2, spectral_index=1):
+def parallel_transport_zamo(geos, beta_v, chi, g, b, Q_frac=0.2, spectral_index=1):
     """
     Parallel transport stokes vector J = [I, Q, U] to the observer screen. 
     Locally emitted polarization has U=0 (before paralell transport).
@@ -467,8 +473,8 @@ def parallel_transport_zamo(geos, beta_v, chi, g, b, Q_factor=0.2, spectral_inde
         doppler boosting factor.
     b: xr.DataArray,
         Spherical-coordinate magnetic field sampled along the geodesics. component dim='mu'.
-    Q_factor: float, default=0.2, 
-        Scaling of Q with respect to I. Q_factor < 1.0
+    Q_frac: float, default=0.2, 
+        Scaling of Q with respect to I. Q_frac < 1.0
     spectral_index: int, default=1,
         Spectral index used for EHT frequencies.
         
@@ -481,7 +487,7 @@ def parallel_transport_zamo(geos, beta_v, chi, g, b, Q_factor=0.2, spectral_inde
     -----
     Currently doesnt support V component
     """
-    if Q_factor > 1.0 or Q_factor < 0.0: raise AttributeError('Q_factor should be in [0,1]')
+    if Q_frac > 1.0 or Q_frac < 0.0: raise AttributeError('Q_frac should be in [0,1]')
         
     # Compute f (EVPA) in local fluid frame
     # Compute local cross product of wave vector with the magnetic field
@@ -504,7 +510,7 @@ def parallel_transport_zamo(geos, beta_v, chi, g, b, Q_factor=0.2, spectral_inde
     b_mag = np.array(np.sqrt((b**2).sum('mu')))
     sin_th_b = np.sqrt((f_local**2).sum(axis=-1)) / np.sqrt((k_mu_prime**2).sum(axis=-1))
     I = g**spectral_index * b_mag**(spectral_index+1) * sin_th_b**(spectral_index+1)
-    Q = Q_factor * I
+    Q = Q_frac * I
     U = np.zeros_like(Q)
     emitted_qu = np.stack([Q, U], axis=-1)[...,None]
     

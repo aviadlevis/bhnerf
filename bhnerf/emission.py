@@ -231,7 +231,7 @@ def image_plane_dynamics(emission_0, geos, Omega, t_frames, t_injection, J=1.0, 
         emission = np.array(emission)
         
     # Use magnetic fields for polarized synchrotron radiation
-    if not jnp.isscalar(J):
+    if not np.isscalar(J):
         J = utils.expand_dims(J, emission.ndim+1, 0)
         emission = J * utils.expand_dims(emission, emission.ndim+1, 1)
         emission = np.squeeze(emission)
@@ -304,21 +304,20 @@ def fill_unsupervised_emission(emission, coords, rmin=0, rmax=np.Inf, fill_value
     emission = _np.where(r_sq > rmax**2, _np.full_like(emission, fill_value=fill_value), emission)
     return emission
 
-
-def grf_to_image_plane(grf, geos, Omega, J, alpha=2.0, height_std=0.275):
-    alpha = 2.0 
+def grf_to_image_plane(grf, geos, Omega, J, alpha=2.0, std_M=0.275, H_r=0.075):
     fov_M = float(geos.alpha[-1]-geos.alpha[0])
-    gaussian = utils.gaussian_xr([grf.y.size, grf.x.size], [0,0], std=height_std).data
+    gaussian = utils.gaussian_xr([grf.y.size, grf.x.size], [0,0], std=std_M).data
     movie = np.exp(alpha*grf) * gaussian
     
     # Expand the 2D grf into 3D
-    emission = utils.expand_3d(movie, fov_z=fov_M, H_r=0.075)
+    emission = utils.expand_3d(movie, fov_z=fov_M, H_r=H_r)
+    emission.coords.update(utils.linspace_xr(emission.shape[1:], -fov_M/2, fov_M/2))
     image_plane = image_plane_dynamics(emission, geos, Omega, 0.0, 0.0, J, slow_light=False)
     return image_plane
 
-def normalize_stokes(movie, I_flux, P_flux):
-    flux = movie[:,0].sum(axis=(-1,-2)).mean()
+def normalize_stokes(movie, I_flux, P_flux, V_flux):
     dolp = np.sqrt(np.sum(movie[:,1:].sum(axis=(-1,-2))**2, axis=1)).mean()
-    movie[:,0]  *= I_flux / flux
-    movie[:,1:] *= P_flux / dolp
+    movie[:,0]  *= I_flux / movie[:,0].sum(axis=(-1,-2)).mean()
+    movie[:,1:3] *= P_flux / dolp
+    movie[:,0]  *= I_flux / movie[:,3].sum(axis=(-1,-2)).mean()
     return movie
