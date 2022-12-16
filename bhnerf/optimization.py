@@ -65,7 +65,7 @@ def run(runname, batchsize, num_iters, state, train_step, raytracing_args, rmin,
     with SummaryWriter(logdir=logdir) as writer:
         if emission_true is not None: writer.add_images('emission/true', bhnerf.utils.intensity_to_nchw(emission_true), global_step=0)
 
-        for i in tqdm(range(init_step, init_step + num_iters + 1), desc='iteration'):
+        for i in tqdm(range(init_step, init_step + num_iters), desc='iteration'):
             batch_indices = train_step.args[0].sample(batchsize)
             loss, state, images = train_step(state, raytracing_args, indices=batch_indices)
 

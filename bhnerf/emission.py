@@ -319,5 +319,5 @@ def normalize_stokes(movie, I_flux, P_flux, V_flux):
     dolp = np.sqrt(np.sum(movie[:,1:].sum(axis=(-1,-2))**2, axis=1)).mean()
     movie[:,0]  *= I_flux / movie[:,0].sum(axis=(-1,-2)).mean()
     movie[:,1:3] *= P_flux / dolp
-    movie[:,0]  *= I_flux / movie[:,3].sum(axis=(-1,-2)).mean()
+    movie[:,3]  *= V_flux / movie[:,3].sum(axis=(-1,-2)).mean()
     return movie

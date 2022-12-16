@@ -377,7 +377,7 @@ def zamo_frame_velocity(geos, beta, chi):
     umu = xr.concat([ut, ur, uth, uph], dim='mu', coords='minimal')
     return umu
 
-def parallel_transport(geos, umu, g, b, Q_frac=0.2, V_frac=0.1, spectral_index=1):
+def parallel_transport(geos, umu, g, b, Q_frac=0.2, V_frac=0.01, spectral_index=1):
     """
     Parallel transport stokes vector J = [I, Q, U] to the observer screen. 
     Locally emitted polarization has U=0 (before paralell transport).
