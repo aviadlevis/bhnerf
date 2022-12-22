@@ -9,7 +9,7 @@ import jax
 from jax import numpy as jnp
 import functools
 
-def plot_stokes_lc(lightcurves, t_frames=None, axes=None, label=None, color=None, linestyle=None, add_mean=False):
+def plot_stokes_lc(lightcurves, t_frames=None, axes=None, label=None, color=None, fmt='.', add_mean=False):
     num_stokes = lightcurves.shape[-1]
     t_frames = range(lightcurves.shape[0]) if t_frames is None else t_frames
     
@@ -21,13 +21,13 @@ def plot_stokes_lc(lightcurves, t_frames=None, axes=None, label=None, color=None
     
     for i in range(num_stokes):
         axes[i].set_title('{} lightcurve'.format(stokes_components[i]))
-        axes[i].plot(t_frames, lightcurves[:, i], color=color, linestyle=linestyle, label=label)
+        axes[i].errorbar(t_frames, lightcurves[:, i], color=color, fmt=fmt, label=label)
         
         if add_mean:
-            axes[i].axhline(lightcurves[:,i].mean(), linestyle='--', color='r')
+            axes[i].axhline(lightcurves[:,i].mean(), linestyle='--', color='black')
             
     axes[num_stokes].set_title('Q-U loop')
-    axes[num_stokes].plot(lightcurves[0:,1], lightcurves[0:,2], color=color, linestyle=linestyle, label=label)
+    axes[num_stokes].scatter(lightcurves[0:,1], lightcurves[0:,2], s=3, label=label)
     plt.tight_layout()
     
 def plot_evpa_ticks(Q, U, alpha, beta, ax=None, scale=None, color=None, pivot='mid', headaxislength=0, headlength=0, width=0.005):

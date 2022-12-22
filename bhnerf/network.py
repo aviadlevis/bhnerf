@@ -186,7 +186,7 @@ class NeRF_Predictor(nn.Module):
         return emission
     
 def image_plane_prediction(params, predictor_fn, t_frames, coords, Omega, J,
-                           g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, t_units):
+                           g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, z_width, t_units):
     """
     Predict image pixels from NeRF emission values
 
@@ -220,6 +220,8 @@ def image_plane_prediction(params, predictor_fn, t_frames, coords, Omega, J,
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
+    z_width: float, 
+        Maximum width of the disk (M units) 
     t_units: astropy.units, 
         Time units for t_frames.
         
@@ -231,7 +233,7 @@ def image_plane_prediction(params, predictor_fn, t_frames, coords, Omega, J,
         An array of predicted images at different times (t_frames)
     """
     emission = predictor_fn({'params': params}, t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection)
-    emission = bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax, use_jax=True)
+    emission = bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax, z_width, use_jax=True)
     if not jnp.isscalar(J):
         J = bhnerf.utils.expand_dims(J, emission.ndim+1, 0, use_jax=True)
         emission = J * bhnerf.utils.expand_dims(emission, emission.ndim+1, 1, use_jax=True)
@@ -240,7 +242,7 @@ def image_plane_prediction(params, predictor_fn, t_frames, coords, Omega, J,
     return images
 
 def loss_fn_image(params, predictor_fn, target, sigma, t_frames, coords, Omega, J, g, dtau, 
-                  Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, scale, t_units, dtype):
+                  Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale, t_units, dtype):
     """
     An L2 loss function for image pixels
 
@@ -278,6 +280,8 @@ def loss_fn_image(params, predictor_fn, target, sigma, t_frames, coords, Omega, 
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
+    z_width: float, 
+        Maximum width of the disk (M units) 
     scale: float, 
         Scaling factor for the loss
     t_units: astropy.units, 
@@ -293,8 +297,8 @@ def loss_fn_image(params, predictor_fn, target, sigma, t_frames, coords, Omega, 
         An array of predicted images at different times (t_frames)
     """
     images = image_plane_prediction(
-        params, predictor_fn, t_frames, coords, Omega, J,g, dtau, Sigma,
-        t_start_obs, t_geos, t_injection, rmin, rmax, t_units
+        params, predictor_fn, t_frames, coords, Omega, J, g, dtau, Sigma,
+        t_start_obs, t_geos, t_injection, rmin, rmax, z_width, t_units
     )
     if dtype == 'full':
         loss = jnp.sum(jnp.abs((images - target)/sigma)**2)
@@ -307,7 +311,7 @@ def loss_fn_image(params, predictor_fn, target, sigma, t_frames, coords, Omega, 
     return scale*loss, [images]
 
 def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega, J,
-                g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, scale, t_units, dtype):
+                g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale, t_units, dtype):
     """
     An chi-square loss function for EHT observations
 
@@ -347,6 +351,8 @@ def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega,
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
+    z_width: float, 
+        Maximum width of the disk (M units) 
     scale: float, 
         Scaling factor for the loss
     t_units: astropy.units, 
@@ -363,7 +369,7 @@ def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega,
     """
     images = image_plane_prediction(
         params, predictor_fn, t_frames, coords, Omega, J, g, dtau, Sigma,
-        t_start_obs, t_geos, t_injection, rmin, rmax, t_units
+        t_start_obs, t_geos, t_injection, rmin, rmax, z_width, t_units
     )
     
     # Reshape images to match A operations
@@ -393,7 +399,7 @@ def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega,
 
 @functools.partial(jit, static_argnums=(1, 2))
 def gradient_step_image(state, t_units, dtype, target, sigma, t_frames, coords, Omega, J, g, dtau, Sigma,
-                        t_start_obs, t_geos, t_injection, rmin, rmax, scale):
+                        t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale):
     """
     Gradient step function for fitting the image-plane directly
     This function computed gradients and updates the state. 
@@ -434,6 +440,8 @@ def gradient_step_image(state, t_units, dtype, target, sigma, t_frames, coords, 
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
+    z_width: float, 
+        Maximum width of the disk (M units) 
     scale: float, 
         Scaling factor for the loss
         
@@ -446,14 +454,14 @@ def gradient_step_image(state, t_units, dtype, target, sigma, t_frames, coords, 
     """
     (loss, [images]), grads = jax.value_and_grad(loss_fn_image, argnums=(0), has_aux=True)(
         state.params, state.apply_fn, target, sigma, t_frames, coords, Omega, J, g, dtau, Sigma, 
-        t_start_obs, t_geos, t_injection, rmin, rmax, scale, t_units, dtype)
+        t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale, t_units, dtype)
     grads = jax.lax.pmean(grads, axis_name='batch')
     state = state.apply_gradients(grads=grads)
     return loss, state, images
 
 @functools.partial(jit, static_argnums=(1, 2))
 def gradient_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, J, g, dtau, 
-                      Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, scale):
+                      Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale):
     """
     Gradient step function for fitting eht observations
     This function computed gradients and updates the state. 
@@ -498,6 +506,8 @@ def gradient_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords,
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
+    z_width: float, 
+        Maximum width of the disk (M units) 
     scale: float, 
         Scaling factor for the loss
         
@@ -510,14 +520,14 @@ def gradient_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords,
     """
     (loss, [images]), grads = jax.value_and_grad(loss_fn_eht, argnums=(0), has_aux=True)(
         state.params, state.apply_fn, target, sigma, A, t_frames, coords, Omega, J, g, dtau, Sigma, 
-        t_start_obs, t_geos, t_injection, rmin, rmax, scale, t_units, dtype)
+        t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale, t_units, dtype)
     grads = jax.lax.pmean(grads, axis_name='batch')
     state = state.apply_gradients(grads=grads)
     return loss, state, images
 
 @functools.partial(jit, static_argnums=(1, 2))
 def test_image(state, t_units, dtype, target, sigma, t_frames, coords, Omega, J, g, dtau, Sigma, 
-                    t_start_obs, t_geos, t_injection, rmin, rmax, scale):
+                    t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale):
     """
     Test step function for fitting the image-plane directly. 
     This function is identical to train_step_image except does not compute gradients or 
@@ -559,6 +569,8 @@ def test_image(state, t_units, dtype, target, sigma, t_frames, coords, Omega, J,
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
+    z_width: float, 
+        Maximum width of the disk (M units) 
     scale: float, 
         Scaling factor for the loss
         
@@ -571,12 +583,12 @@ def test_image(state, t_units, dtype, target, sigma, t_frames, coords, Omega, J,
     """
     loss, [images] = loss_fn_image(
         state.params, state.apply_fn, target, sigma, t_frames, coords, Omega, J, g, dtau, Sigma, 
-        t_start_obs, t_geos, t_injection, rmin, rmax, scale, t_units, dtype)      
+        t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale, t_units, dtype)      
     return loss, state, images
 
 @functools.partial(jit, static_argnums=(1, 2))
 def test_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, J, g, dtau, Sigma, 
-             t_start_obs, t_geos, t_injection, rmin, rmax, scale):
+             t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale):
     """
     Test step function for fitting eht observations
     This function is identical to train_step_image except does not compute gradients or 
@@ -620,6 +632,8 @@ def test_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, J
         The minimum radius for recovery
     rmax: float, 
         The maximum radius for recovery
+    z_width: float, 
+        Maximum width of the disk (M units) 
     scale: float, 
         Scaling factor for the loss
         
@@ -631,10 +645,10 @@ def test_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, J
         An array of predicted images at different times (t_frames)
     """
     loss, [images] = loss_fn_eht(state.params, state.apply_fn, target, sigma, A, t_frames, coords, Omega, J, g, dtau, Sigma, 
-                                 t_start_obs, t_geos, t_injection, rmin, rmax, scale, t_units, dtype)
+                                 t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale, t_units, dtype)
     return loss, state, images
        
-def sample_3d_grid(apply_fn, params, rmin=0.0, rmax=np.inf, fov=None, coords=None, resolution=64): 
+def sample_3d_grid(apply_fn, params, rmin=0.0, rmax=np.inf, z_width=np.inf, fov=None, coords=None, resolution=64): 
     """
     Parameters
     ----------
@@ -646,6 +660,8 @@ def sample_3d_grid(apply_fn, params, rmin=0.0, rmax=np.inf, fov=None, coords=Non
         Zero values at radii < rmin
     rmax: float, default=np.inf
         Zero values at radii > rmax,
+    z_width: float, default=np.inf
+        Maximum width of the disk (M units) 
     fov: float, default=None
         Field of view. If None then coords need to be provided.
     coords: array(shape=(3,npoints)), optional, 
@@ -666,7 +682,7 @@ def sample_3d_grid(apply_fn, params, rmin=0.0, rmax=np.inf, fov=None, coords=Non
 
     # Get the a grid values sampled from the neural network
     emission = apply_fn({'params': params}, 0.0, None, coords, 0.0, 0.0, 0.0, 0.0)
-    emission =  bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax)
+    emission =  bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax, z_width)
     return emission
     
 def load_checkpoint(path, predictor):
@@ -689,7 +705,7 @@ def load_checkpoint(path, predictor):
     state = checkpoints.restore_checkpoint(path, None)
     return state
 
-def raytracing_args(geos, Omega, t_injection, t_start_obs, rmax, J=1.0):
+def raytracing_args(geos, Omega, t_injection, t_start_obs, rmax, z_width, J=1.0):
     """
     Return a list (ordered) with the ray tracing (non-optimized) arguments . 
     
@@ -705,6 +721,8 @@ def raytracing_args(geos, Omega, t_injection, t_start_obs, rmax, J=1.0):
         Start time for observations
     rmax: float, 
         The maximum radius for recovery
+    z_width: float, 
+        Maximum width of the disk (M units) 
     J: np.array(shape=(3,...)), default=1.0
         Stokes vector scaling factors including parallel transport (I, Q, U). J=1.0 gives non-polarized emission.
         
@@ -735,7 +753,35 @@ def raytracing_args(geos, Omega, t_injection, t_start_obs, rmax, J=1.0):
         't_geos': t_geos, 
         't_injection': t_injection, 
         'rmin': rmin, 
-        'rm': rmax
+        'rmax': rmax,
+        'z_width': z_width
     })
 
     return raytracing_args
+
+def tv_reg(apply_fn, params, coords):
+    """
+    Calculates a proxy for TV regularization which involves evaluating
+      
+    Parameters
+    ----------
+    apply_fn: nn.Module
+        A coordinate-based neural net for predicting the emission values as a continuous function
+    params: dict, 
+        A dictionary with network parameters (from state.params)
+    coords: list of arrays, 
+        For 3D emission coords=[x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
+        alpha, beta are image coordinates. These arrays contain the ray integration points
+          
+    Returns
+    ------- 
+    reg_term: the value of the TV regularization cost of the MLP evaluated at points coords
+    """
+    def predict_eta(coords):
+        return apply_fn({'params': params}, 0.0, None, coords, 0.0, 0.0, 0.0, 0.0)
+    
+    pred_eta_grad_fn = jax.vmap(jax.value_and_grad(predict_eta), in_axes=(0,))
+    _, eta_grad = pred_eta_grad_fn(coords)
+    reg_term = jnp.sum(jnp.absolute(eta_grad)) * lam
+    
+    return reg_term

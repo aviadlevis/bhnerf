@@ -274,7 +274,7 @@ def propogate_flatspace_emission(emission_0, Omega_3D, t_frames, rot_axis=[0,0,1
     emission_t = interpolate_coords(emission_0, warped_coords)
     return emission_t
 
-def fill_unsupervised_emission(emission, coords, rmin=0, rmax=np.Inf, fill_value=0.0, use_jax=False):
+def fill_unsupervised_emission(emission, coords, rmin=0, rmax=np.Inf, z_width=2.0, fill_value=0.0, use_jax=False):
     """
     Fill emission that is not within the supervision region
     
@@ -288,6 +288,8 @@ def fill_unsupervised_emission(emission, coords, rmin=0, rmax=np.Inf, fill_value
         Zero values at radii < rmin
     rmax: float, default=np.inf
         Zero values at radii > rmax
+    z_width: float, default=2,
+        Maximum width of the disk (M units) 
     fill_value: float, default=0.0
         Fill value is default to zero 
     use_jax: bool, default=False,
@@ -302,6 +304,7 @@ def fill_unsupervised_emission(emission, coords, rmin=0, rmax=np.Inf, fill_value
     r_sq = _np.sum(_np.array([_np.squeeze(x)**2 for x in coords]), axis=0)
     emission = _np.where(r_sq < rmin**2, _np.full_like(emission, fill_value=fill_value), emission)
     emission = _np.where(r_sq > rmax**2, _np.full_like(emission, fill_value=fill_value), emission)
+    emission = _np.where(_np.abs(coords[2]) > z_width, _np.full_like(emission, fill_value=fill_value), emission)
     return emission
 
 def grf_to_image_plane(grf, geos, Omega, J, alpha=2.0, std_M=0.275, H_r=0.075):

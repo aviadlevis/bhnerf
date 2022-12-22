@@ -6,8 +6,10 @@ from bhnerf import kgeo
 import os
 from astropy import units   
 from flax.training import checkpoints
+from tqdm.auto import tqdm
+import tensorboardX
 
-def run(runname, batchsize, num_iters, state, train_step, raytracing_args, rmin, rmax, emission_true=None, vis_res=64, log_period=100, save_period=1000):
+def run(runname, batchsize, num_iters, state, train_step, raytracing_args, rmin, rmax, z_width, emission_true=None, vis_res=64, log_period=100, save_period=1000):
     """
     Run a gradient descent optimization over the network parameters (3D emission) 
     
@@ -15,10 +17,10 @@ def run(runname, batchsize, num_iters, state, train_step, raytracing_args, rmin,
     ----------
     runname: str, 
         String used for logging and saving checkpoints.
-    num_iters: int, 
-        number of iterations, 
     batchsize: int, 
         should be an integer factor of the number of GPUs used
+    num_iters: int, 
+        number of iterations, 
     state: flax.training.train_state.TrainState, 
         The training state holding the network parameters and apply_fn
     train_step: TrainStep, 
@@ -29,6 +31,8 @@ def run(runname, batchsize, num_iters, state, train_step, raytracing_args, rmin,
         The minim radius for visualization
     rmax: float, 
         The maximum radius for recovery
+    z_width: float, 
+        Maximum width of the disk (M units) 
     emission_true: array, 
         A ground-truth array of 3D emission for evalutation metrics 
     vis_res: int, default=64
@@ -45,7 +49,6 @@ def run(runname, batchsize, num_iters, state, train_step, raytracing_args, rmin,
     """
     
     from tensorboardX import SummaryWriter
-    from tqdm.notebook import tqdm
     
     # Logging parameters
     checkpoint_dir = '../checkpoints/{}'.format(runname)
@@ -72,9 +75,10 @@ def run(runname, batchsize, num_iters, state, train_step, raytracing_args, rmin,
             # Log the current state on TensorBoard
             writer.add_scalar('log_loss/train', np.log10(np.mean(loss)), global_step=i)
             if (i == 1) or ((i % log_period) == 0) or (i ==  init_step + num_iters):
-                emission_grid = bhnerf.network.sample_3d_grid(state.apply_fn, state.params, rmin, rmax, coords=vis_coords)
+                emission_grid = bhnerf.network.sample_3d_grid(state.apply_fn, state.params, rmin, rmax, z_width, coords=vis_coords)
                 writer.add_images('emission/estimate', bhnerf.utils.intensity_to_nchw(emission_grid), global_step=i)
                 # if 'lr_inject' in hparams.keys(): writer.add_scalar('t_injection', float(current_state.params['t_injection']), global_step=i)
+                
                 if emission_true is not None:
                     writer.add_scalar('emission/mse', bhnerf.utils.mse(emission_true.data, emission_grid), global_step=i)
                     writer.add_scalar('emission/psnr', bhnerf.utils.psnr(emission_true.data, emission_grid), global_step=i)
@@ -83,35 +87,43 @@ def run(runname, batchsize, num_iters, state, train_step, raytracing_args, rmin,
             if np.isscalar(save_period) and ((i % save_period == 0) or (i ==  init_step + num_iters)):
                 current_state = jax.device_get(flax.jax_utils.unreplicate(state))
                 checkpoints.save_checkpoint(checkpoint_dir, current_state, int(i), keep=5)
+                
     return current_state
 
-def loop_over_inclination(geos_base, inc_grid, b_consts, runname, hparams, predictor, train_step, rmax, t_injection,   
-                          emission_true=None, vis_res=64, log_period=100):
+def loop_over_inclination(runname, batchsize, hparams, inc_grid, spin, fov_M, Q_frac, 
+                          b_consts, predictor, train_step,  
+                          num_alpha=64, num_beta=64, seed=1, 
+                          emission_true=None, vis_res=64, save_period=10000, log_period=100):
     """
     Run a gradient descent optimization over the network parameters (3D emission) 
     
     Parameters
     ----------
+    runname: str, 
+        String used for logging and saving checkpoints.
+    batchsize: int, 
+        should be an integer factor of the number of GPUs used
+    hparams: dict, 
+        'num_iters': int, number of iterations, 
+        'lr_init': float, initial learning rate,
+        'lr_final': float, final learning rate
     inc_grid, array,
         A grid of inclination values to loop over.
     b_consts: list, 
         Constants magnetic field components: b_consts = [b_r, b_th, b_ph]
-    runname: str, 
-        String used for logging and saving checkpoints.
-    hparams: dict, 
-        'num_iters': int, number of iterations, 
-        'lr_init': float, initial learning rate,
-        'lr_final': float, final learning rate, 
-        'batchsize': int, should be an integer factor of the number of GPUs used
+    state: flax.training.train_state.TrainState, 
+        The training state holding the network parameters and apply_fn
     predictor: flax.training.train_state.TrainState, 
         The training state holding the network parameters and apply_fn
     train_step: TrainStep, 
         A conatiner for parallel mapping of the training function
     rmax: float, 
         The maximum radius for recovery
-    t_injection: float, 
-        Time of hotspot injection in M units.
-    emission_true: array, 
+    Q_frac: float, 
+        Fraction of polarization
+    seed: int, 
+        Seed to initialize the neural network weights.
+    emission_true: array, optional
         A ground-truth array of 3D emission for evalutation metrics 
     vis_res: int, default=64
         Resolution (number of grid points in x,y,z) at which to visualize the contiuous 3D emission
@@ -120,33 +132,43 @@ def loop_over_inclination(geos_base, inc_grid, b_consts, runname, hparams, predi
     """
     from tqdm.notebook import tqdm
     
+    rmax = fov_M / 2
     for inclination in tqdm(np.atleast_1d(inc_grid), desc='inc'):
         geos = kgeo.image_plane_geos(
-            float(geos_base.spin), inclination, 
-            num_alpha=geos_base.alpha.size, num_beta=geos_base.beta.size, 
-            alpha_range=[float(geos_base.alpha[0]), float(geos_base.alpha[-1])],
-            beta_range=[float(geos_base.beta[0]), float(geos_base.beta[-1])]
+            spin, inclination, 
+            num_alpha=num_alpha, num_beta=num_beta, 
+            alpha_range=[-rmax, rmax],
+            beta_range=[-rmax, rmax]
         )
         geos = geos.fillna(0.0)
-        
+        t_injection = -float(geos.r_o)
+        rmin = float(geos.r.min())
+
         # Keplerian prograde velocity field
         Omega = np.sign(geos.spin + np.finfo(float).eps) * np.sqrt(geos.M) / (geos.r**(3/2) + geos.spin * np.sqrt(geos.M))
         umu = kgeo.azimuthal_velocity_vector(geos, Omega)
         g = kgeo.doppler_factor(geos, umu)
         b = kgeo.magnetic_field(geos, *b_consts) 
-        J = np.nan_to_num(kgeo.parallel_transport(geos, umu, g, b), 0.0)
+        J = np.nan_to_num(bhnerf.kgeo.parallel_transport(geos, umu, g, b, Q_frac=Q_frac, V_frac=0), 0.0)
 
+        raytracing_args = bhnerf.network.raytracing_args(geos, Omega, t_injection, train_step.args[0].t_start_obs, rmax, J)
+        params = predictor.init_params(raytracing_args, seed=seed)
+        
         runname_inc = runname + '.inc_{:.1f}'.format(np.rad2deg(inclination))
-        run(runname_inc, hparams, predictor, train_step, geos, Omega, rmax, t_injection, J, emission_true, vis_res, log_period, hparams['num_iters'])
+        checkpoint_dir = '../checkpoints/{}'.format(runname_inc)
+        checkpoint_dir = checkpoint_dir if os.path.isdir(checkpoint_dir) else None
+        state = predictor.init_state(params, **hparams, checkpoint_dir=checkpoint_dir)
 
-def total_movie_loss(checkpoint_dir, batchsize, state, train_step, raytracing_args, rmax, return_frames=False):
+        bhnerf.optimization.run(runname_inc, batchsize, hparams['num_iters'], state, train_step, raytracing_args, 
+                                rmin, rmax, emission_true=emission_true, vis_res=vis_res, 
+                                log_period=log_period, save_period=save_period)
+
+def total_movie_loss(batchsize, state, train_step, raytracing_args, rmax, return_frames=False):
     """
     This function chunks up the movie into frames which fit on GPUs and sums the total loss over all frames 
     
     Parameters
     ----------
-    checkpoint_dir: str, 
-        Path to directory with latest checkpoint
     batchsize: int, 
         batchsize should be an integer factor of the number of GPUs used
     state: flax.training.train_state.TrainState, 
@@ -165,9 +187,6 @@ def total_movie_loss(checkpoint_dir, batchsize, state, train_step, raytracing_ar
     total_loss: float,
         The total loss over all frames.
     """
-    if not os.path.exists(checkpoint_dir): 
-        raise AttributeError('checkpoint directory does not exist: {}'.format(checkpoint_dir))
-    
     # Split times according to batchsize and number of devices
     nt = train_step.args[0].num_frames
     
@@ -196,7 +215,46 @@ def total_movie_loss(checkpoint_dir, batchsize, state, train_step, raytracing_ar
         
     return output
 
-
+class Optimizer(object):
+    def __init__(self, hparams, predictor, raytracing_args, save_period=-1, checkpoint_dir='', keep=5):
+        self.step = 0 
+        self.init_step = 0
+        self.num_iters = hparams['num_iters']
+        self.checkpoint_dir = checkpoint_dir
+        self.save_period = self.num_iters if save_period<0 else save_period
+        self.loss = np.inf
+        self.keep = keep
+        self.seed = hparams.get('seed', 1)
+        
+        params = predictor.init_params(raytracing_args, seed=self.seed)
+        self.state = predictor.init_state(
+            params=params, 
+            num_iters=self.num_iters, 
+            lr_init=hparams.get('lr_init', 1e-4),
+            lr_final=hparams.get('lr_final', 1e-6),
+            lr_inject=hparams.get('lr_inject', None),
+            checkpoint_dir=self.checkpoint_dir
+        )
+        self.init_step = flax.jax_utils.unreplicate(self.state.step) + 1
+        self.final_step = self.init_step + self.num_iters
+        
+    def log(self):
+        for log_fn in self.log_fns:
+            log_fn(self)
+            
+    def save_checkpoint(self):
+        if (self.checkpoint_dir != '') and ((self.step % self.save_period == 0) or (self.step ==  self.final_step)):
+            current_state = jax.device_get(flax.jax_utils.unreplicate(self.state))
+            checkpoints.save_checkpoint(self.checkpoint_dir, current_state, int(self.step), keep=self.keep)
+        
+    def run(self, batchsize, train_step, raytracing_args, log_fns=[]):
+        self.log_fns = log_fns = np.atleast_1d(log_fns)
+        for self.step in tqdm(range(self.init_step, self.final_step), desc='iteration'):
+            batch_indices = train_step.args[0].sample(batchsize)
+            self.loss, self.state, images = train_step(self.state, raytracing_args, indices=batch_indices)
+            self.log()
+            self.save_checkpoint()
+    
 class TrainStep(object):
     
     def __init__(self, dtype, args, grad_pmap, test_pmap, scale):
@@ -252,11 +310,11 @@ class TrainStep(object):
         args = TemporalBatchedArgs(t_frames, [target, sigma])
         grad_pmap = jax.pmap(bhnerf.network.gradient_step_image,
                              axis_name='batch', 
-                             in_axes=(0, None, None, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None),
+                             in_axes=(0, None, None, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None, None),
                              static_broadcasted_argnums=(1, 2))
         test_pmap = jax.pmap(bhnerf.network.test_image,
                      axis_name='batch', 
-                     in_axes=(0, None, None, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None),
+                     in_axes=(0, None, None, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None, None),
                      static_broadcasted_argnums=(1, 2))
         return cls(dtype, args, grad_pmap, test_pmap, scale)
     
@@ -301,12 +359,12 @@ class TrainStep(object):
         args = TemporalBatchedArgs(t_frames, [target, sigma, A])
         grad_pmap = jax.pmap(bhnerf.network.gradient_step_eht, 
                 axis_name='batch', 
-                in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None), 
+                in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None, None), 
                 static_broadcasted_argnums=(1, 2)) 
         
         test_pmap = jax.pmap(bhnerf.network.test_eht, 
                 axis_name='batch', 
-                in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None), 
+                in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None, None), 
                 static_broadcasted_argnums=(1, 2)) 
         
         return cls(dtype, args, grad_pmap, test_pmap, scale)
@@ -344,8 +402,43 @@ class TemporalBatchedArgs(object):
     @property
     def t_start_obs(self):
         return self.t_frames[0]
+
+class SummaryWriter(tensorboardX.SummaryWriter):
+    def __init__(self, logdir=None, comment='', purge_step=None, max_queue=10, flush_secs=120,
+                 filename_suffix='', write_to_disk=True, log_dir=None, **kwargs):
+        super().__init__(logdir, comment, purge_step, max_queue, flush_secs,
+                         filename_suffix, write_to_disk, log_dir, **kwargs)
     
+    def recovery_3d(self, rmin, rmax, z_width, vis_res=64, emission_true=None):
+        # Grid for visualization (no interpolation is added for easy comparison)
+        if emission_true is not None:
+            vis_coords = np.array(np.meshgrid(np.linspace(emission_true.x[0], emission_true.x[-1], emission_true.shape[0]),
+                                              np.linspace(emission_true.y[0], emission_true.y[-1], emission_true.shape[1]),
+                                              np.linspace(emission_true.z[0], emission_true.z[-1], emission_true.shape[2]),
+                                              indexing='ij'))
+        else:
+            grid_1d = np.linspace(-rmax, rmax, vis_res)
+            vis_coords = np.array(np.meshgrid(grid_1d, grid_1d, grid_1d, indexing='ij'))
+            
+        def log_fn(opt):
+            emission_grid = bhnerf.network.sample_3d_grid(opt.state.apply_fn, opt.state.params, rmin, rmax, z_width, coords=vis_coords)
+            self.add_images('emission/estimate', bhnerf.utils.intensity_to_nchw(emission_grid), global_step=opt.step)
+            if emission_true is not None:
+                self.add_scalar('emission/mse', bhnerf.utils.mse(emission_true.data, emission_grid), global_step=opt.step)
+                self.add_scalar('emission/psnr', bhnerf.utils.psnr(emission_true.data, emission_grid), global_step=opt.step)
+        
+        return log_fn
     
+class LogFn(object):
+    def __init__(self, log_fn, log_period=-1):
+        self.log_period = log_period
+        self.log_fn = log_fn
+        
+    def __call__(self, optimizer):
+        if (optimizer.step == 1) or ((optimizer.step % self.log_period) == 0):
+            self.log_fn(optimizer)
+            
+            
 def shard(xs):
     """Split data into shards for multiple devices along the first dimension."""
     return jax.tree_map(lambda x: x.reshape((jax.local_device_count(), -1) + x.shape[1:]), xs)

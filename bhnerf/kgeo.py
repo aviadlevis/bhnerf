@@ -456,6 +456,7 @@ def parallel_transport(geos, umu, g, b, Q_frac=0.2, V_frac=0.01, spectral_index=
     J_qu = np.moveaxis(np.squeeze(np.matmul(rot_matrix, emitted_qu), axis=-1), -1, 0)
     J_v = np.array(V)[None,...]
     J = np.concatenate([J_i, J_qu, J_v])
+    if V_frac==0: J = J[:3]
     return J
 
 def parallel_transport_zamo(geos, beta_v, chi, g, b, Q_frac=0.2, spectral_index=1):
