@@ -8,87 +8,7 @@ from astropy import units
 from flax.training import checkpoints
 from tqdm.auto import tqdm
 import tensorboardX
-
-def run(runname, batchsize, num_iters, state, train_step, raytracing_args, rmin, rmax, z_width, emission_true=None, vis_res=64, log_period=100, save_period=1000):
-    """
-    Run a gradient descent optimization over the network parameters (3D emission) 
-    
-    Parameters
-    ----------
-    runname: str, 
-        String used for logging and saving checkpoints.
-    batchsize: int, 
-        should be an integer factor of the number of GPUs used
-    num_iters: int, 
-        number of iterations, 
-    state: flax.training.train_state.TrainState, 
-        The training state holding the network parameters and apply_fn
-    train_step: TrainStep, 
-        A conatiner for parallel mapping of the training function
-    raytracing_args: OrderedDict, 
-        dictionary with arguments used for ray tracing
-    rmin: float, 
-        The minim radius for visualization
-    rmax: float, 
-        The maximum radius for recovery
-    z_width: float, 
-        Maximum width of the disk (M units) 
-    emission_true: array, 
-        A ground-truth array of 3D emission for evalutation metrics 
-    vis_res: int, default=64
-        Resolution (number of grid points in x,y,z) at which to visualize the contiuous 3D emission
-    log_period: int, default=100
-        TensorBoard logging every `log_period` iterations
-    save_period: int, default=1000
-        Save checkpoint every `save_period` iterations
-        
-    Returns
-    -------
-    current_state: flax.training.train_state.TrainState, 
-        The training state holding the network parameters at the end of the optimization
-    """
-    
-    from tensorboardX import SummaryWriter
-    
-    # Logging parameters
-    checkpoint_dir = '../checkpoints/{}'.format(runname)
-    logdir = '../runs/{}'.format(runname)
-    
-    # Grid for visualization (no interpolation is added for easy comparison)
-    if emission_true is not None:
-        vis_coords = np.array(np.meshgrid(np.linspace(emission_true.x[0], emission_true.x[-1], emission_true.shape[0]),
-                                          np.linspace(emission_true.y[0], emission_true.y[-1], emission_true.shape[1]),
-                                          np.linspace(emission_true.z[0], emission_true.z[-1], emission_true.shape[2]),
-                                          indexing='ij'))
-    else:
-        grid_1d = np.linspace(-rmax, rmax, vis_res)
-        vis_coords = np.array(np.meshgrid(grid_1d, grid_1d, grid_1d, indexing='ij'))
-
-    init_step = flax.jax_utils.unreplicate(state.step) + 1
-    with SummaryWriter(logdir=logdir) as writer:
-        if emission_true is not None: writer.add_images('emission/true', bhnerf.utils.intensity_to_nchw(emission_true), global_step=0)
-
-        for i in tqdm(range(init_step, init_step + num_iters), desc='iteration'):
-            batch_indices = train_step.args[0].sample(batchsize)
-            loss, state, images = train_step(state, raytracing_args, indices=batch_indices)
-
-            # Log the current state on TensorBoard
-            writer.add_scalar('log_loss/train', np.log10(np.mean(loss)), global_step=i)
-            if (i == 1) or ((i % log_period) == 0) or (i ==  init_step + num_iters):
-                emission_grid = bhnerf.network.sample_3d_grid(state.apply_fn, state.params, rmin, rmax, z_width, coords=vis_coords)
-                writer.add_images('emission/estimate', bhnerf.utils.intensity_to_nchw(emission_grid), global_step=i)
-                # if 'lr_inject' in hparams.keys(): writer.add_scalar('t_injection', float(current_state.params['t_injection']), global_step=i)
-                
-                if emission_true is not None:
-                    writer.add_scalar('emission/mse', bhnerf.utils.mse(emission_true.data, emission_grid), global_step=i)
-                    writer.add_scalar('emission/psnr', bhnerf.utils.psnr(emission_true.data, emission_grid), global_step=i)
-
-            # Save checkpoints occasionally
-            if np.isscalar(save_period) and ((i % save_period == 0) or (i ==  init_step + num_iters)):
-                current_state = jax.device_get(flax.jax_utils.unreplicate(state))
-                checkpoints.save_checkpoint(checkpoint_dir, current_state, int(i), keep=5)
-                
-    return current_state
+import matplotlib.pyplot as plt
 
 def loop_over_inclination(runname, batchsize, hparams, inc_grid, spin, fov_M, Q_frac, 
                           b_consts, predictor, train_step,  
@@ -163,7 +83,7 @@ def loop_over_inclination(runname, batchsize, hparams, inc_grid, spin, fov_M, Q_
                                 rmin, rmax, emission_true=emission_true, vis_res=vis_res, 
                                 log_period=log_period, save_period=save_period)
 
-def total_movie_loss(batchsize, state, train_step, raytracing_args, rmax, return_frames=False):
+def total_movie_loss(batchsize, state, train_step, raytracing_args, return_frames=False):
     """
     This function chunks up the movie into frames which fit on GPUs and sums the total loss over all frames 
     
@@ -177,8 +97,6 @@ def total_movie_loss(batchsize, state, train_step, raytracing_args, rmax, return
         A conatiner for parallel mapping of the training/testing function
     raytracing_args: OrderedDict, 
         dictionary with arguments used for ray tracing
-    rmax: float, 
-        The maximum radius for recovery
     return_frames: bool, default=False, 
         Return the estimated movie frames
 
@@ -216,6 +134,28 @@ def total_movie_loss(batchsize, state, train_step, raytracing_args, rmax, return
     return output
 
 class Optimizer(object):
+    """
+    Run a gradient descent optimization over the network parameters (3D emission) 
+    
+    Parameters
+    ----------
+    hparams: dict, 
+        'num_iters': int, number of iterations, 
+        'lr_init': float, initial learning rate, defualt=1e-4
+        'lr_final': float, final learning rate, default=1e-6
+        'lr_inject': float, learning rate for hotspot injection time, default=None
+        'seed': random seed for NN initialization, default=1
+    predictor: flax.training.train_state.TrainState, 
+        The training state holding the network parameters and apply_fn
+    raytracing_args: OrderedDict, 
+        dictionary with arguments used for ray tracing
+    save_period: int, default=-1
+        Save checkpoint every `save_period` iterations. Negative value means every iteration.
+    save_period: str, default=''
+        Checkpoint directory. '' means no checkpoint saved
+    keep: int, default=5,
+        How many checkpoint history to keep.
+    """
     def __init__(self, hparams, predictor, raytracing_args, save_period=-1, checkpoint_dir='', keep=5):
         self.step = 0 
         self.init_step = 0
@@ -248,12 +188,20 @@ class Optimizer(object):
             checkpoints.save_checkpoint(self.checkpoint_dir, current_state, int(self.step), keep=self.keep)
         
     def run(self, batchsize, train_step, raytracing_args, log_fns=[]):
+        
         self.log_fns = log_fns = np.atleast_1d(log_fns)
-        for self.step in tqdm(range(self.init_step, self.final_step), desc='iteration'):
-            batch_indices = train_step.args[0].sample(batchsize)
-            self.loss, self.state, images = train_step(self.state, raytracing_args, indices=batch_indices)
-            self.log()
-            self.save_checkpoint()
+        self.train_step = train_step
+        self.raytracing_args = raytracing_args
+        
+        try:
+            for self.step in tqdm(range(self.init_step, self.final_step), desc='iteration'):
+                batch_indices = train_step.args[0].sample(batchsize)
+                self.loss, self.state, images = train_step(self.state, raytracing_args, indices=batch_indices)
+                self.log()
+                self.save_checkpoint()
+                
+        except KeyboardInterrupt:
+            return
     
 class TrainStep(object):
     
@@ -306,7 +254,7 @@ class TrainStep(object):
         dtype: str, default='full',
             Currently supports 'full' or 'lc' (lightcurve)
         """
-        sigma = sigma * np.ones_like(target) if np.isscalar(sigma) else sigma
+        sigma = sigma * np.ones_like(target)
         args = TemporalBatchedArgs(t_frames, [target, sigma])
         grad_pmap = jax.pmap(bhnerf.network.gradient_step_image,
                              axis_name='batch', 
@@ -421,13 +369,32 @@ class SummaryWriter(tensorboardX.SummaryWriter):
             vis_coords = np.array(np.meshgrid(grid_1d, grid_1d, grid_1d, indexing='ij'))
             
         def log_fn(opt):
-            emission_grid = bhnerf.network.sample_3d_grid(opt.state.apply_fn, opt.state.params, rmin, rmax, z_width, coords=vis_coords)
+            emission_grid = bhnerf.network.sample_3d_grid(
+                opt.state.apply_fn, opt.state.params, rmin, rmax, z_width, coords=vis_coords
+            )
             self.add_images('emission/estimate', bhnerf.utils.intensity_to_nchw(emission_grid), global_step=opt.step)
             if emission_true is not None:
                 self.add_scalar('emission/mse', bhnerf.utils.mse(emission_true.data, emission_grid), global_step=opt.step)
                 self.add_scalar('emission/psnr', bhnerf.utils.psnr(emission_true.data, emission_grid), global_step=opt.step)
         
         return log_fn
+    
+    def plot_lc_datafit(self, opt, target, stokes, t_frames=None, batchsize=20):
+        
+        plt.style.use('default')
+        
+        _, movie = bhnerf.optimization.total_movie_loss(
+            batchsize, opt.state, opt.train_step, opt.raytracing_args, return_frames=True
+        )
+        lc_est = movie.sum(axis=(-1,-2))
+        axes = bhnerf.visualization.plot_stokes_lc(target, stokes, t_frames, label='True')
+        axes = bhnerf.visualization.plot_stokes_lc(lc_est, stokes, t_frames, axes=axes, fmt='x', color='r', label='Estimate')
+        
+        for ax in axes:
+            ax.legend()
+            
+        self.add_figure('lightcurve/datafit', plt.gcf(), global_step=opt.step)
+
     
 class LogFn(object):
     def __init__(self, log_fn, log_period=-1):

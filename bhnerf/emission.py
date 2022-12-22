@@ -318,9 +318,10 @@ def grf_to_image_plane(grf, geos, Omega, J, alpha=2.0, std_M=0.275, H_r=0.075):
     image_plane = image_plane_dynamics(emission, geos, Omega, 0.0, 0.0, J, slow_light=False)
     return image_plane
 
-def normalize_stokes(movie, I_flux, P_flux, V_flux):
+def normalize_stokes(movie, I_flux, P_flux, V_flux=None):
     dolp = np.sqrt(np.sum(movie[:,1:].sum(axis=(-1,-2))**2, axis=1)).mean()
     movie[:,0]  *= I_flux / movie[:,0].sum(axis=(-1,-2)).mean()
     movie[:,1:3] *= P_flux / dolp
-    movie[:,3]  *= V_flux / movie[:,3].sum(axis=(-1,-2)).mean()
+    if V_flux is not None:
+        movie[:,3]  *= V_flux / movie[:,3].sum(axis=(-1,-2)).mean()
     return movie

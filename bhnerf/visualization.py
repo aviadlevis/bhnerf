@@ -9,26 +9,35 @@ import jax
 from jax import numpy as jnp
 import functools
 
-def plot_stokes_lc(lightcurves, t_frames=None, axes=None, label=None, color=None, fmt='.', add_mean=False):
-    num_stokes = lightcurves.shape[-1]
+def plot_stokes_lc(lightcurves, stokes, t_frames=None, axes=None, label=None, color=None, fmt='.', add_mean=False):
+    
+    num_stokes = len(stokes)
+    if lightcurves.shape[1] != num_stokes:
+        raise AttributeError('lightcurve data doesnt match stokes number: {}'.format(num_stokes))
+
     t_frames = range(lightcurves.shape[0]) if t_frames is None else t_frames
     
-    if axes is None:
-        fig, axes = plt.subplots(1, num_stokes+1, figsize=(12,3))
-    if len(axes) != num_stokes + 1:
-        raise AttributeError('axes lengths should be num_stokes+1')
-    stokes_components = ['I', 'Q', 'U', 'V']
+    num_axes = num_stokes
+    if 'Q' in stokes and 'U' in stokes: num_axes += 1
     
+    if axes is None:
+        fig, axes = plt.subplots(1, num_axes, figsize=(3*num_axes,3))
+        
+    if len(axes) != num_axes:
+        raise AttributeError('axes lengths should be {}'.format(num_axes))
+
     for i in range(num_stokes):
-        axes[i].set_title('{} lightcurve'.format(stokes_components[i]))
+        axes[i].set_title('{} lightcurve'.format(stokes[i]))
         axes[i].errorbar(t_frames, lightcurves[:, i], color=color, fmt=fmt, label=label)
         
         if add_mean:
-            axes[i].axhline(lightcurves[:,i].mean(), linestyle='--', color='black')
+            axes[i].axhline(lightcurves[:,i].mean(), linestyle='--', color='r')
             
-    axes[num_stokes].set_title('Q-U loop')
-    axes[num_stokes].scatter(lightcurves[0:,1], lightcurves[0:,2], s=3, label=label)
+    if 'Q' in stokes and 'U' in stokes:
+        axes[-1].set_title('Q-U loop')
+        axes[-1].scatter(lightcurves[0:,stokes.index('Q')], lightcurves[0:,stokes.index('U')], s=3, label=label)
     plt.tight_layout()
+    return axes
     
 def plot_evpa_ticks(Q, U, alpha, beta, ax=None, scale=None, color=None, pivot='mid', headaxislength=0, headlength=0, width=0.005):
     aolp = (np.arctan2(U, Q) / 2) 
