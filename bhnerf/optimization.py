@@ -175,8 +175,9 @@ class Optimizer(object):
             lr_inject=hparams.get('lr_inject', None),
             checkpoint_dir=self.checkpoint_dir
         )
-        self.init_step = flax.jax_utils.unreplicate(self.state.step) + 1
-        self.final_step = self.init_step + self.num_iters
+        
+        if checkpoint_dir != '':
+            predictor.save_params(checkpoint_dir)
         
     def log(self):
         for log_fn in self.log_fns:
@@ -189,6 +190,8 @@ class Optimizer(object):
         
     def run(self, batchsize, train_step, raytracing_args, log_fns=[]):
         
+        self.init_step = flax.jax_utils.unreplicate(self.state.step) + 1
+        self.final_step = self.init_step + self.num_iters
         self.log_fns = log_fns = np.atleast_1d(log_fns)
         self.train_step = train_step
         self.raytracing_args = raytracing_args
@@ -238,7 +241,7 @@ class TrainStep(object):
         return TrainStep(dtype, args, grad_pmap, test_pmap, scale)
     
     @classmethod
-    def image(cls, t_frames, target, sigma=1.0, scale=1.0, dtype='full'):
+    def image(cls, t_frames, target, sigma=1.0, offset=0.0, scale=1.0, dtype='full'):
         """
         Construct a training step for image plane measurements
         
@@ -255,14 +258,15 @@ class TrainStep(object):
             Currently supports 'full' or 'lc' (lightcurve)
         """
         sigma = sigma * np.ones_like(target)
-        args = TemporalBatchedArgs(t_frames, [target, sigma])
+        offset = offset * np.ones_like(target)
+        args = TemporalBatchedArgs(t_frames, [target, sigma, offset])
         grad_pmap = jax.pmap(bhnerf.network.gradient_step_image,
                              axis_name='batch', 
-                             in_axes=(0, None, None, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None, None),
+                             in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None),
                              static_broadcasted_argnums=(1, 2))
         test_pmap = jax.pmap(bhnerf.network.test_image,
                      axis_name='batch', 
-                     in_axes=(0, None, None, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None, None),
+                     in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None),
                      static_broadcasted_argnums=(1, 2))
         return cls(dtype, args, grad_pmap, test_pmap, scale)
     
@@ -307,12 +311,12 @@ class TrainStep(object):
         args = TemporalBatchedArgs(t_frames, [target, sigma, A])
         grad_pmap = jax.pmap(bhnerf.network.gradient_step_eht, 
                 axis_name='batch', 
-                in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None, None), 
+                in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None), 
                 static_broadcasted_argnums=(1, 2)) 
         
         test_pmap = jax.pmap(bhnerf.network.test_eht, 
                 axis_name='batch', 
-                in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None, None), 
+                in_axes=(0, None, None, 0, 0, 0, 0, None, None, None, None, None, None, None, None, None, None), 
                 static_broadcasted_argnums=(1, 2)) 
         
         return cls(dtype, args, grad_pmap, test_pmap, scale)
@@ -357,7 +361,7 @@ class SummaryWriter(tensorboardX.SummaryWriter):
         super().__init__(logdir, comment, purge_step, max_queue, flush_secs,
                          filename_suffix, write_to_disk, log_dir, **kwargs)
     
-    def recovery_3d(self, rmin, rmax, z_width, vis_res=64, emission_true=None):
+    def recovery_3d(self, fov, vis_res=64, emission_true=None):
         # Grid for visualization (no interpolation is added for easy comparison)
         if emission_true is not None:
             vis_coords = np.array(np.meshgrid(np.linspace(emission_true.x[0], emission_true.x[-1], emission_true.shape[0]),
@@ -365,13 +369,11 @@ class SummaryWriter(tensorboardX.SummaryWriter):
                                               np.linspace(emission_true.z[0], emission_true.z[-1], emission_true.shape[2]),
                                               indexing='ij'))
         else:
-            grid_1d = np.linspace(-rmax, rmax, vis_res)
+            grid_1d = np.linspace(-fov/2, fov/2, vis_res)
             vis_coords = np.array(np.meshgrid(grid_1d, grid_1d, grid_1d, indexing='ij'))
             
         def log_fn(opt):
-            emission_grid = bhnerf.network.sample_3d_grid(
-                opt.state.apply_fn, opt.state.params, rmin, rmax, z_width, coords=vis_coords
-            )
+            emission_grid = bhnerf.network.sample_3d_grid(opt.state.apply_fn, opt.state.params, coords=vis_coords)
             self.add_images('emission/estimate', bhnerf.utils.intensity_to_nchw(emission_grid), global_step=opt.step)
             if emission_true is not None:
                 self.add_scalar('emission/mse', bhnerf.utils.mse(emission_true.data, emission_grid), global_step=opt.step)

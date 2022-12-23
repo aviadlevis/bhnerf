@@ -10,6 +10,8 @@ from bhnerf import kgeo
 from jax import jit
 from flax.training import train_state, checkpoints
 import optax
+from pathlib import Path
+import yaml
 
 safe_sin = lambda x: jnp.sin(x % (100 * jnp.pi))
 
@@ -93,6 +95,14 @@ class NeRF_Predictor(nn.Module):
     
     Parameters
     ----------
+    scale: float, default=1.0       
+        scale of the domain; scales the NN inputs
+    rmin: float, default=0.0        
+        minimum radius for recovery
+    rmax: float, default=np.inf     
+        maximum radius for recovery
+    z_width: float, default=np.inf  
+        maximum width of the disk (M units)
     posenc_deg: int, default=3
     net_depth: int, default=4
     net_width: int, default=128
@@ -100,6 +110,10 @@ class NeRF_Predictor(nn.Module):
     out_channel: int default=1
     do_skip: bool, default=True
     """
+    scale: float = 1.0
+    rmin: float = 0.0
+    rmax: float = np.inf
+    z_width: float = np.inf 
     posenc_deg: int = 3
     net_depth: int = 4
     net_width: int = 128
@@ -160,7 +174,7 @@ class NeRF_Predictor(nn.Module):
             Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
         t_injection: float, 
             Time of hotspot injection in M units.
-        
+
         Returns
         -------
         emission: jnp.array,
@@ -175,18 +189,32 @@ class NeRF_Predictor(nn.Module):
             # Zero emission prior to injection time
             valid_inputs_mask = jnp.isfinite(warped_coords)
             net_input = jnp.where(valid_inputs_mask, warped_coords, jnp.zeros_like(warped_coords))
-            net_output = emission_MLP(posenc(net_input, self.posenc_deg))
+            net_output = emission_MLP(posenc(net_input / self.scale, self.posenc_deg))
             emission = nn.sigmoid(net_output[..., 0] - 10.0)
+            emission = bhnerf.emission.fill_unsupervised_emission(emission, coords, self.rmin, self.rmax, self.z_width, use_jax=True)
             emission = jnp.where(valid_inputs_mask[..., 0], emission, jnp.zeros_like(emission))
-            
             return emission
         
         t_injection_param = self.param('t_injection', lambda key, values: jnp.array(values, dtype=jnp.float32), t_injection)
         emission = predict_emission(t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection_param)
         return emission
     
+    def save_params(self, directory, filename='NeRF_Predictor_params.yml'):
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        params = self.__dict__.copy()
+        params.pop('_state', None)
+        params.pop('activation', None)
+        with open(directory.joinpath(filename), 'w') as yaml_file:
+            yaml.dump(params, yaml_file)
+        
+    @classmethod
+    def from_yml(cls, directory, filename='NeRF_Predictor_params.yml'):
+        params = yaml.safe_load(Path(directory).joinpath(filename).read_text())
+        return cls(**params)
+
 def image_plane_prediction(params, predictor_fn, t_frames, coords, Omega, J,
-                           g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, z_width, t_units):
+                           g, dtau, Sigma, t_start_obs, t_geos, t_injection, t_units):
     """
     Predict image pixels from NeRF emission values
 
@@ -216,12 +244,6 @@ def image_plane_prediction(params, predictor_fn, t_frames, coords, Omega, J,
         Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
     t_injection: float, 
         Time of hotspot injection in M units.
-    rmin: float, 
-        The minimum radius for recovery
-    rmax: float, 
-        The maximum radius for recovery
-    z_width: float, 
-        Maximum width of the disk (M units) 
     t_units: astropy.units, 
         Time units for t_frames.
         
@@ -233,7 +255,6 @@ def image_plane_prediction(params, predictor_fn, t_frames, coords, Omega, J,
         An array of predicted images at different times (t_frames)
     """
     emission = predictor_fn({'params': params}, t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection)
-    emission = bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax, z_width, use_jax=True)
     if not jnp.isscalar(J):
         J = bhnerf.utils.expand_dims(J, emission.ndim+1, 0, use_jax=True)
         emission = J * bhnerf.utils.expand_dims(emission, emission.ndim+1, 1, use_jax=True)
@@ -241,8 +262,8 @@ def image_plane_prediction(params, predictor_fn, t_frames, coords, Omega, J,
     images = kgeo.radiative_trasfer(emission, g, dtau, Sigma, use_jax=True)
     return images
 
-def loss_fn_image(params, predictor_fn, target, sigma, t_frames, coords, Omega, J, g, dtau, 
-                  Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale, t_units, dtype):
+def loss_fn_image(params, predictor_fn, target, sigma, offset, t_frames, coords, Omega, J, g, dtau, 
+                  Sigma, t_start_obs, t_geos, t_injection, scale, t_units, dtype):
     """
     An L2 loss function for image pixels
 
@@ -256,6 +277,8 @@ def loss_fn_image(params, predictor_fn, target, sigma, t_frames, coords, Omega, 
         Target images to fit the model to. 
     sigma: array,
         An array of standard deviations for each pixel
+    offset: array,
+        A bias or offset for each pixel
     t_frames: array, 
         Array of time for each image frame
     coords: list of arrays, 
@@ -276,12 +299,6 @@ def loss_fn_image(params, predictor_fn, target, sigma, t_frames, coords, Omega, 
         Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
     t_injection: float, 
         Time of hotspot injection in M units.
-    rmin: float, 
-        The minimum radius for recovery
-    rmax: float, 
-        The maximum radius for recovery
-    z_width: float, 
-        Maximum width of the disk (M units) 
     scale: float, 
         Scaling factor for the loss
     t_units: astropy.units, 
@@ -297,21 +314,20 @@ def loss_fn_image(params, predictor_fn, target, sigma, t_frames, coords, Omega, 
         An array of predicted images at different times (t_frames)
     """
     images = image_plane_prediction(
-        params, predictor_fn, t_frames, coords, Omega, J, g, dtau, Sigma,
-        t_start_obs, t_geos, t_injection, rmin, rmax, z_width, t_units
+        params, predictor_fn, t_frames, coords, Omega, J, g, dtau, Sigma, t_start_obs, t_geos, t_injection, t_units
     )
     if dtype == 'full':
-        loss = jnp.sum(jnp.abs((images - target)/sigma)**2)
+        loss = jnp.sum(jnp.abs((images - target - offset)/sigma)**2)
     elif dtype == 'lc':
         lightcurve = images.sum(axis=(-1,-2))
-        loss = jnp.sum(jnp.abs((lightcurve - target)/sigma)**2)
+        loss = jnp.sum(jnp.abs((lightcurve - target - offset)/sigma)**2)
     else:
         raise AttributeError('image dtype ({}) not supported'.format(dtype))
         
     return scale*loss, [images]
 
 def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega, J,
-                g, dtau, Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale, t_units, dtype):
+                g, dtau, Sigma, t_start_obs, t_geos, t_injection, scale, t_units, dtype):
     """
     An chi-square loss function for EHT observations
 
@@ -347,12 +363,6 @@ def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega,
         Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
     t_injection: float, 
         Time of hotspot injection in M units.
-    rmin: float, 
-        The minimum radius for recovery
-    rmax: float, 
-        The maximum radius for recovery
-    z_width: float, 
-        Maximum width of the disk (M units) 
     scale: float, 
         Scaling factor for the loss
     t_units: astropy.units, 
@@ -368,8 +378,7 @@ def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega,
         An array of predicted images at different times (t_frames)
     """
     images = image_plane_prediction(
-        params, predictor_fn, t_frames, coords, Omega, J, g, dtau, Sigma,
-        t_start_obs, t_geos, t_injection, rmin, rmax, z_width, t_units
+        params, predictor_fn, t_frames, coords, Omega, J, g, dtau, Sigma, t_start_obs, t_geos, t_injection, t_units
     )
     
     # Reshape images to match A operations
@@ -398,8 +407,8 @@ def loss_fn_eht(params, predictor_fn, target, sigma, A, t_frames, coords, Omega,
     return scale*chisq, [images]
 
 @functools.partial(jit, static_argnums=(1, 2))
-def gradient_step_image(state, t_units, dtype, target, sigma, t_frames, coords, Omega, J, g, dtau, Sigma,
-                        t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale):
+def gradient_step_image(state, t_units, dtype, target, sigma, offset, t_frames, coords, Omega, J, g, dtau, Sigma,
+                        t_start_obs, t_geos, t_injection, scale):
     """
     Gradient step function for fitting the image-plane directly
     This function computed gradients and updates the state. 
@@ -416,6 +425,8 @@ def gradient_step_image(state, t_units, dtype, target, sigma, t_frames, coords, 
         Target images to fit the model to. 
     sigma: array,
         An array of standard deviations for each pixel
+    offset: array,
+        A bias or offset for each pixel
     t_frames: array, 
         Array of time for each image frame
     coords: list of arrays, 
@@ -436,12 +447,6 @@ def gradient_step_image(state, t_units, dtype, target, sigma, t_frames, coords, 
         Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
     t_injection: float, 
         Time of hotspot injection in M units.
-    rmin: float, 
-        The minimum radius for recovery
-    rmax: float, 
-        The maximum radius for recovery
-    z_width: float, 
-        Maximum width of the disk (M units) 
     scale: float, 
         Scaling factor for the loss
         
@@ -453,15 +458,15 @@ def gradient_step_image(state, t_units, dtype, target, sigma, t_frames, coords, 
         An array of predicted images at different times (t_frames)
     """
     (loss, [images]), grads = jax.value_and_grad(loss_fn_image, argnums=(0), has_aux=True)(
-        state.params, state.apply_fn, target, sigma, t_frames, coords, Omega, J, g, dtau, Sigma, 
-        t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale, t_units, dtype)
+        state.params, state.apply_fn, target, sigma, offset, t_frames, coords, Omega, J, g, dtau, Sigma, 
+        t_start_obs, t_geos, t_injection, scale, t_units, dtype)
     grads = jax.lax.pmean(grads, axis_name='batch')
     state = state.apply_gradients(grads=grads)
     return loss, state, images
 
 @functools.partial(jit, static_argnums=(1, 2))
 def gradient_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, J, g, dtau, 
-                      Sigma, t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale):
+                      Sigma, t_start_obs, t_geos, t_injection, scale):
     """
     Gradient step function for fitting eht observations
     This function computed gradients and updates the state. 
@@ -502,12 +507,6 @@ def gradient_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords,
         Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
     t_injection: float, 
         Time of hotspot injection in M units.
-    rmin: float, 
-        The minimum radius for recovery
-    rmax: float, 
-        The maximum radius for recovery
-    z_width: float, 
-        Maximum width of the disk (M units) 
     scale: float, 
         Scaling factor for the loss
         
@@ -520,14 +519,14 @@ def gradient_step_eht(state, t_units, dtype, target, sigma, A, t_frames, coords,
     """
     (loss, [images]), grads = jax.value_and_grad(loss_fn_eht, argnums=(0), has_aux=True)(
         state.params, state.apply_fn, target, sigma, A, t_frames, coords, Omega, J, g, dtau, Sigma, 
-        t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale, t_units, dtype)
+        t_start_obs, t_geos, t_injection, scale, t_units, dtype)
     grads = jax.lax.pmean(grads, axis_name='batch')
     state = state.apply_gradients(grads=grads)
     return loss, state, images
 
 @functools.partial(jit, static_argnums=(1, 2))
-def test_image(state, t_units, dtype, target, sigma, t_frames, coords, Omega, J, g, dtau, Sigma, 
-                    t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale):
+def test_image(state, t_units, dtype, target, sigma, offset, t_frames, coords, Omega, J, g, dtau, Sigma, 
+                    t_start_obs, t_geos, t_injection, scale):
     """
     Test step function for fitting the image-plane directly. 
     This function is identical to train_step_image except does not compute gradients or 
@@ -545,6 +544,8 @@ def test_image(state, t_units, dtype, target, sigma, t_frames, coords, Omega, J,
         Target images to fit the model to. 
     sigma: array,
         An array of standard deviations for each pixel
+    offset: array,
+        A bias or offset for each pixel
     t_frames: array, 
         Array of time for each image frame
     coords: list of arrays, 
@@ -565,12 +566,6 @@ def test_image(state, t_units, dtype, target, sigma, t_frames, coords, Omega, J,
         Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
     t_injection: float, 
         Time of hotspot injection in M units.
-    rmin: float, 
-        The minimum radius for recovery
-    rmax: float, 
-        The maximum radius for recovery
-    z_width: float, 
-        Maximum width of the disk (M units) 
     scale: float, 
         Scaling factor for the loss
         
@@ -582,13 +577,13 @@ def test_image(state, t_units, dtype, target, sigma, t_frames, coords, Omega, J,
         An array of predicted images at different times (t_frames)
     """
     loss, [images] = loss_fn_image(
-        state.params, state.apply_fn, target, sigma, t_frames, coords, Omega, J, g, dtau, Sigma, 
-        t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale, t_units, dtype)      
+        state.params, state.apply_fn, target, sigma, offset, t_frames, coords, Omega, J, g, dtau, Sigma, 
+        t_start_obs, t_geos, t_injection, scale, t_units, dtype)      
     return loss, state, images
 
 @functools.partial(jit, static_argnums=(1, 2))
 def test_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, J, g, dtau, Sigma, 
-             t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale):
+             t_start_obs, t_geos, t_injection, scale):
     """
     Test step function for fitting eht observations
     This function is identical to train_step_image except does not compute gradients or 
@@ -628,12 +623,6 @@ def test_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, J
         Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
     t_injection: float, 
         Time of hotspot injection in M units.
-    rmin: float, 
-        The minimum radius for recovery
-    rmax: float, 
-        The maximum radius for recovery
-    z_width: float, 
-        Maximum width of the disk (M units) 
     scale: float, 
         Scaling factor for the loss
         
@@ -645,10 +634,10 @@ def test_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, J
         An array of predicted images at different times (t_frames)
     """
     loss, [images] = loss_fn_eht(state.params, state.apply_fn, target, sigma, A, t_frames, coords, Omega, J, g, dtau, Sigma, 
-                                 t_start_obs, t_geos, t_injection, rmin, rmax, z_width, scale, t_units, dtype)
+                                 t_start_obs, t_geos, t_injection, scale, t_units, dtype)
     return loss, state, images
        
-def sample_3d_grid(apply_fn, params, rmin=0.0, rmax=np.inf, z_width=np.inf, fov=None, coords=None, resolution=64): 
+def sample_3d_grid(apply_fn, params, fov=None, coords=None, resolution=64): 
     """
     Parameters
     ----------
@@ -656,12 +645,6 @@ def sample_3d_grid(apply_fn, params, rmin=0.0, rmax=np.inf, z_width=np.inf, fov=
         A coordinate-based neural net for predicting the emission values as a continuous function
     params: dict, 
         A dictionary with network parameters (from state.params)
-    rmin: float, default=0
-        Zero values at radii < rmin
-    rmax: float, default=np.inf
-        Zero values at radii > rmax,
-    z_width: float, default=np.inf
-        Maximum width of the disk (M units) 
     fov: float, default=None
         Field of view. If None then coords need to be provided.
     coords: array(shape=(3,npoints)), optional, 
@@ -682,30 +665,9 @@ def sample_3d_grid(apply_fn, params, rmin=0.0, rmax=np.inf, z_width=np.inf, fov=
 
     # Get the a grid values sampled from the neural network
     emission = apply_fn({'params': params}, 0.0, None, coords, 0.0, 0.0, 0.0, 0.0)
-    emission =  bhnerf.emission.fill_unsupervised_emission(emission, coords, rmin, rmax, z_width)
     return emission
-    
-def load_checkpoint(path, predictor):
-    """
-    Load network checkpoint. 
-    
-    Parameters
-    ----------
-    path: str, 
-        Path to directory (loads latest checkpoint) or a specific checkpoint
-    predictor: nn.Module,
-        A NN predictor module to restore weights to. Should match the checkpoint module.
-        
-    Returns
-    -------
-    state: flax.training.train_state.TrainState, 
-        The training state holding the network parameters at the end of the optimization
-    """
-    from flax.training import checkpoints
-    state = checkpoints.restore_checkpoint(path, None)
-    return state
 
-def raytracing_args(geos, Omega, t_injection, t_start_obs, rmax, z_width, J=1.0):
+def raytracing_args(geos, Omega, t_injection, t_start_obs, J=1.0):
     """
     Return a list (ordered) with the ray tracing (non-optimized) arguments . 
     
@@ -719,10 +681,6 @@ def raytracing_args(geos, Omega, t_injection, t_start_obs, rmax, z_width, J=1.0)
         Time of hotspot injection in M units.
     t_start_obs: astropy.Quantity, 
         Start time for observations
-    rmax: float, 
-        The maximum radius for recovery
-    z_width: float, 
-        Maximum width of the disk (M units) 
     J: np.array(shape=(3,...)), default=1.0
         Stokes vector scaling factors including parallel transport (I, Q, U). J=1.0 gives non-polarized emission.
         
@@ -740,7 +698,6 @@ def raytracing_args(geos, Omega, t_injection, t_start_obs, rmax, z_width, J=1.0)
     dtau = jnp.array(geos.dtau)
     Sigma = jnp.array(geos.Sigma)
     t_geos = jnp.array(geos.t)
-    rmin = geos.r.min().data
 
     raytracing_args = OrderedDict({
         'coords': coords, 
@@ -751,10 +708,7 @@ def raytracing_args(geos, Omega, t_injection, t_start_obs, rmax, z_width, J=1.0)
         'Sigma': Sigma, 
         't_start_obs': t_start_obs, 
         't_geos': t_geos, 
-        't_injection': t_injection, 
-        'rmin': rmin, 
-        'rmax': rmax,
-        'z_width': z_width
+        't_injection': t_injection
     })
 
     return raytracing_args
