@@ -11,9 +11,10 @@ import tensorboardX
 import matplotlib.pyplot as plt
 
 def loop_over_inclination(runname, batchsize, hparams, inc_grid, spin, fov_M, Q_frac, 
-                          b_consts, predictor, train_step,  
-                          num_alpha=64, num_beta=64, seed=1, 
-                          emission_true=None, vis_res=64, save_period=10000, log_period=100):
+                          b_consts, predictor, train_step, t_frames, target, 
+                          Omega_dir='cw', stokes=['I', 'Q', 'U'], evpa_rotation=0.0,
+                          num_alpha=64, num_beta=64, emission_true=None, vis_res=64, 
+                          save_period=5000, log_period=200):
     """
     Run a gradient descent optimization over the network parameters (3D emission) 
     
@@ -51,37 +52,46 @@ def loop_over_inclination(runname, batchsize, hparams, inc_grid, spin, fov_M, Q_
         TensorBoard logging every `log_period` iterations
     """
     from tqdm.notebook import tqdm
+    from bhnerf.optimization import LogFn
     
-    rmax = fov_M / 2
+    J_inds = [['I', 'Q', 'U'].index(s) for s in stokes]
+    rot_sign = {'cw': -1, 'ccw': 1}
+    
     for inclination in tqdm(np.atleast_1d(inc_grid), desc='inc'):
         geos = kgeo.image_plane_geos(
             spin, inclination, 
             num_alpha=num_alpha, num_beta=num_beta, 
-            alpha_range=[-rmax, rmax],
-            beta_range=[-rmax, rmax]
+            alpha_range=[-fov_M/2, fov_M/2],
+            beta_range=[-fov_M/2, fov_M/2]
         )
         geos = geos.fillna(0.0)
         t_injection = -float(geos.r_o)
-        rmin = float(geos.r.min())
 
         # Keplerian prograde velocity field
-        Omega = np.sign(geos.spin + np.finfo(float).eps) * np.sqrt(geos.M) / (geos.r**(3/2) + geos.spin * np.sqrt(geos.M))
+        Omega = rot_sign[Omega_dir] * np.sqrt(geos.M) / (geos.r**(3/2) + geos.spin * np.sqrt(geos.M))
         umu = kgeo.azimuthal_velocity_vector(geos, Omega)
         g = kgeo.doppler_factor(geos, umu)
         b = kgeo.magnetic_field(geos, *b_consts) 
-        J = np.nan_to_num(bhnerf.kgeo.parallel_transport(geos, umu, g, b, Q_frac=Q_frac, V_frac=0), 0.0)
+        J = np.nan_to_num(bhnerf.kgeo.parallel_transport(geos, umu, g, b, Q_frac=Q_frac, V_frac=0), 0.0)[J_inds]
+        J_rot = bhnerf.emission.rotate_evpa(J, evpa_rotation)
+        raytracing_args = bhnerf.network.raytracing_args(geos, Omega, t_injection, t_frames[0], J_rot)
 
-        raytracing_args = bhnerf.network.raytracing_args(geos, Omega, t_injection, train_step.args[0].t_start_obs, rmax, J)
-        params = predictor.init_params(raytracing_args, seed=seed)
-        
         runname_inc = runname + '.inc_{:.1f}'.format(np.rad2deg(inclination))
-        checkpoint_dir = '../checkpoints/{}'.format(runname_inc)
-        checkpoint_dir = checkpoint_dir if os.path.isdir(checkpoint_dir) else None
-        state = predictor.init_state(params, **hparams, checkpoint_dir=checkpoint_dir)
+        writer = SummaryWriter(logdir='../runs/{}'.format(runname_inc))
+        log_fns = [
+            LogFn(lambda opt: writer.add_scalar('log_loss/train', np.log10(np.mean(opt.loss)), global_step=opt.step)), 
+            LogFn(lambda opt: writer.recovery_3d(fov_M, vis_res, emission_true)(opt), log_period=log_period),
+            LogFn(lambda opt: writer.plot_lc_datafit(opt, target, stokes, t_frames, batchsize=20), log_period=log_period)
+        ]
+        
+        optimizer = bhnerf.optimization.Optimizer(
+            hparams, predictor, raytracing_args, 
+            save_period=save_period,
+            checkpoint_dir='../checkpoints/{}'.format(runname_inc)
+        )
 
-        bhnerf.optimization.run(runname_inc, batchsize, hparams['num_iters'], state, train_step, raytracing_args, 
-                                rmin, rmax, emission_true=emission_true, vis_res=vis_res, 
-                                log_period=log_period, save_period=save_period)
+        optimizer.run(batchsize, train_step, raytracing_args, log_fns=log_fns)
+        writer.close()
 
 def total_movie_loss(batchsize, state, train_step, raytracing_args, return_frames=False):
     """
@@ -374,7 +384,8 @@ class SummaryWriter(tensorboardX.SummaryWriter):
             
         def log_fn(opt):
             emission_grid = bhnerf.network.sample_3d_grid(opt.state.apply_fn, opt.state.params, coords=vis_coords)
-            self.add_images('emission/estimate', bhnerf.utils.intensity_to_nchw(emission_grid), global_step=opt.step)
+            volume_slices = bhnerf.utils.intensity_to_nchw(emission_grid)
+            self.add_images('emission/estimate', volume_slices, dataformats='NCWH', global_step=opt.step)
             if emission_true is not None:
                 self.add_scalar('emission/mse', bhnerf.utils.mse(emission_true.data, emission_grid), global_step=opt.step)
                 self.add_scalar('emission/psnr', bhnerf.utils.psnr(emission_true.data, emission_grid), global_step=opt.step)
@@ -411,10 +422,4 @@ class LogFn(object):
 def shard(xs):
     """Split data into shards for multiple devices along the first dimension."""
     return jax.tree_map(lambda x: x.reshape((jax.local_device_count(), -1) + x.shape[1:]), xs)
-
-def flattened_traversal(fn):
-    def mask(data):
-        flat = flax.traverse_util.flatten_dict(data)
-        return flax.traverse_util.unflatten_dict({k: fn(k, v) for k, v in flat.items()})
-    return mask
 

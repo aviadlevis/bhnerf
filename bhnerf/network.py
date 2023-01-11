@@ -637,7 +637,7 @@ def test_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, J
                                  t_start_obs, t_geos, t_injection, scale, t_units, dtype)
     return loss, state, images
        
-def sample_3d_grid(apply_fn, params, fov=None, coords=None, resolution=64): 
+def sample_3d_grid(apply_fn, params, fov=None, coords=None, resolution=64, chunk=-1): 
     """
     Parameters
     ----------
@@ -664,7 +664,14 @@ def sample_3d_grid(apply_fn, params, fov=None, coords=None, resolution=64):
         raise AttributeError('Either coords or fov+resolution must be provided')
 
     # Get the a grid values sampled from the neural network
-    emission = apply_fn({'params': params}, 0.0, None, coords, 0.0, 0.0, 0.0, 0.0)
+    resolution = coords.shape[-1]
+    chunk = resolution if chunk < 0 else chunk
+    
+    emission = []
+    for c in range(resolution//chunk):
+        coords_chunk = coords[:, c * chunk : (c + 1) * chunk, :, :]
+        emission.append(apply_fn({'params': params}, 0.0, None, coords_chunk, 0.0, 0.0, 0.0, 0.0))
+    emission = np.concatenate(emission, axis=0)
     return emission
 
 def raytracing_args(geos, Omega, t_injection, t_start_obs, J=1.0):
@@ -739,3 +746,9 @@ def tv_reg(apply_fn, params, coords):
     reg_term = jnp.sum(jnp.absolute(eta_grad)) * lam
     
     return reg_term
+
+def flattened_traversal(fn):
+    def mask(data):
+        flat = flax.traverse_util.flatten_dict(data)
+        return flax.traverse_util.unflatten_dict({k: fn(k, v) for k, v in flat.items()})
+    return mask

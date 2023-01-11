@@ -369,7 +369,7 @@ class _VisualizationAccessor(object):
         extent = [movie[image_dims[0]].min(), movie[image_dims[0]].max(),
                   movie[image_dims[1]].min(), movie[image_dims[1]].max()]
 
-        im = ax.imshow(movie.isel({t_dim: 0}), extent=extent, cmap=cmap)
+        im = ax.imshow(movie.isel({t_dim: 0}), extent=extent, origin='lower', cmap=cmap)
         divider = make_axes_locatable(ax)
         cax = divider.append_axes('right', size='5%', pad=0.05)
         cbar = fig.colorbar(im, cax=cax)

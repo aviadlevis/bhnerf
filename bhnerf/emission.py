@@ -174,7 +174,7 @@ def interpolate_coords(emission, coords):
     interpolated_data = scipy.ndimage.map_coordinates(emission, image_coords, order=1, cval=0.)
     return interpolated_data
 
-def image_plane_dynamics(emission_0, geos, Omega, t_frames, t_injection, J=1.0, t_start_obs=None, slow_light=True, rot_axis=[0,0,1], M=consts.sgra_mass):
+def image_plane_dynamics(emission_0, geos, Omega, t_frames, t_injection, J=1.0, t_start_obs=None, slow_light=True, doppler=True, rot_axis=[0,0,1], M=consts.sgra_mass):
     """
     Compute the image-plane dynamics (movie) for a given initial emission and geodesics.
     
@@ -194,6 +194,8 @@ def image_plane_dynamics(emission_0, geos, Omega, t_frames, t_injection, J=1.0, 
         Stokes polarization factors on the geodesic grid. None means no magnetic fields (non-polarized emission).
     t_start_obs: astropy.Quantity, default=None
         Start time for observations, if None t_frames[0] is assumed to be start time.
+    doppler: bool, default=True
+        Modeling doppler boosting.
     slow_light: bool, default=True
         Modeling the time it takes for the propogation of light.
     rot_axis: array, default=[0, 0, 1]
@@ -217,8 +219,11 @@ def image_plane_dynamics(emission_0, geos, Omega, t_frames, t_injection, J=1.0, 
         rot_axis=rot_axis, 
         M=M  
     )
-    umu = kgeo.azimuthal_velocity_vector(geos, Omega)
-    g = kgeo.doppler_factor(geos, umu)
+    
+    g = 1.0
+    if doppler:
+        umu = kgeo.azimuthal_velocity_vector(geos, Omega)
+        g = kgeo.doppler_factor(geos, umu)
     
     if emission_0.ndim == 3:
         emission = interpolate_coords(emission_0, warped_coords)
@@ -325,3 +330,7 @@ def normalize_stokes(movie, I_flux, P_flux, V_flux=None):
     if V_flux is not None:
         movie[:,3]  *= V_flux / movie[:,3].sum(axis=(-1,-2)).mean()
     return movie
+
+def rotate_evpa(qu, angle, axis=0):
+    p = np.exp(2j*angle) * (np.take(qu, 0, axis) + 1j * np.take(qu, 1, axis))
+    return np.stack([p.real, p.imag], axis=axis)
