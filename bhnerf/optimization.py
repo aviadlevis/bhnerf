@@ -38,8 +38,6 @@ def loop_over_inclination(runname, batchsize, hparams, inc_grid, spin, fov_M, Q_
         The training state holding the network parameters and apply_fn
     train_step: TrainStep, 
         A conatiner for parallel mapping of the training function
-    rmax: float, 
-        The maximum radius for recovery
     Q_frac: float, 
         Fraction of polarization
     seed: int, 
@@ -65,10 +63,12 @@ def loop_over_inclination(runname, batchsize, hparams, inc_grid, spin, fov_M, Q_
             beta_range=[-fov_M/2, fov_M/2]
         )
         geos = geos.fillna(0.0)
-        t_injection = -float(geos.r_o)
+        t_injection = -float(geos.r_o + fov_M/4)
 
         # Keplerian prograde velocity field
         Omega = rot_sign[Omega_dir] * np.sqrt(geos.M) / (geos.r**(3/2) + geos.spin * np.sqrt(geos.M))
+        # Omega = rot_sign[Omega_dir] * np.sqrt(geos.M) / (11.0**(3/2) + geos.spin * np.sqrt(geos.M))
+        
         umu = kgeo.azimuthal_velocity_vector(geos, Omega)
         g = kgeo.doppler_factor(geos, umu)
         b = kgeo.magnetic_field(geos, *b_consts) 
@@ -83,6 +83,10 @@ def loop_over_inclination(runname, batchsize, hparams, inc_grid, spin, fov_M, Q_
             LogFn(lambda opt: writer.recovery_3d(fov_M, vis_res, emission_true)(opt), log_period=log_period),
             LogFn(lambda opt: writer.plot_lc_datafit(opt, target, stokes, t_frames, batchsize=20), log_period=log_period)
         ]
+        if 'lr_inject' in hparams:
+            log_fns.append(
+                LogFn(lambda opt: writer.add_scalar('injection_time', optimizer.state.params['t_injection'][0], global_step=opt.step))
+            )
         
         optimizer = bhnerf.optimization.Optimizer(
             hparams, predictor, raytracing_args, 
@@ -137,9 +141,9 @@ def total_movie_loss(batchsize, state, train_step, raytracing_args, return_frame
         if return_frames:
             frames.append(images.reshape(-1, *images.shape[2:]))
             
-    output = total_loss
+    output = total_loss / nt
     if return_frames:
-        output = (total_loss, np.concatenate(frames[:nt]))
+        output = (output, np.concatenate(frames[:nt]))
         
     return output
 
