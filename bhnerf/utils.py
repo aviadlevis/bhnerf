@@ -242,7 +242,7 @@ def expand_3d(movie, fov_z, H_r=0.05, std=0.2, std_clip=3, nz=64):
     emission: np.array,
         3D movie with emission values
     """
-    emission = movie.expand_dims(z=np.linspace(-fov_z/2, fov_z/2, nz), axis=-1)
+    emission = movie.expand_dims(z=np.linspace(-fov_z/2, fov_z/2, nz), axis=-1).transpose('t', 'x', 'y', 'z')
     H = H_r * np.sqrt(emission.x**2 + emission.y**2)
     gaussian = np.exp(-0.5*(emission.z)**2/ H**2).transpose('y', 'x', 'z')
     gaussian.where(gaussian > np.exp(-0.5 * std_clip ** 2)).fillna(0.0)

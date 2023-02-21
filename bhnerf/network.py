@@ -63,6 +63,39 @@ class MLP(nn.Module):
 
         return out
 
+def integrated_posenc(x, x_cov, max_deg, min_deg=0):
+    """
+    Encode `x` with sinusoids scaled by 2^[min_deg:max_deg-1].
+
+    Parameters
+    ----------
+    x: jnp.ndarray, variables to be encoded. Should
+      be in [-pi, pi]. 
+    x_cov: jnp.ndarray, covariance matrices for `x`.
+    max_deg: int, the max degree of the encoding.
+    min_deg: int, the min degree of the encoding. default=0.
+
+    Returns
+    -------
+    encoded: jnp.ndarray, encoded variables.
+    """
+    if jnp.isscalar(x_cov):
+        x_cov = jnp.full_like(x, x_cov)
+    scales = 2**jnp.arange(min_deg, max_deg)
+    shape = list(x.shape[:-1]) + [-1]
+    y = jnp.reshape(x[..., None, :] * scales[:, None], shape)
+    y_var = jnp.reshape(x_cov[..., None, :] * scales[:, None]**2, shape)
+
+    return expected_sin(
+      jnp.concatenate([y, y + 0.5 * jnp.pi], axis=-1),
+      jnp.concatenate([y_var] * 2, axis=-1))
+
+
+def expected_sin(x, x_var):
+    # When the variance is wide, shrink sin towards zero.
+    y = jnp.exp(-0.5 * x_var) * jnp.sin(x)
+    return y
+
 def posenc(x, deg):
     """
     Concatenate `x` with a positional encoding of `x` with degree `deg`.
@@ -104,6 +137,8 @@ class NeRF_Predictor(nn.Module):
     z_width: float, default=np.inf  
         maximum width of the disk (M units)
     posenc_deg: int, default=3
+    posenc_var: float, default=2e-5 
+        Corresponds to variance of uniform distribution variance with voxel width of ~1/64.
     net_depth: int, default=4
     net_width: int, default=128
     activation: Callable[..., Any], default=nn.relu
@@ -115,6 +150,7 @@ class NeRF_Predictor(nn.Module):
     rmax: float = np.inf
     z_width: float = np.inf 
     posenc_deg: int = 3
+    posenc_var: float = 2e-5
     net_depth: int = 4
     net_width: int = 128
     activation: Callable[..., Any] = nn.relu
@@ -189,6 +225,7 @@ class NeRF_Predictor(nn.Module):
             # Zero emission prior to injection time
             valid_inputs_mask = jnp.isfinite(warped_coords)
             net_input = jnp.where(valid_inputs_mask, warped_coords, jnp.zeros_like(warped_coords))
+            # net_output = emission_MLP(integrated_posenc(net_input / self.scale, self.posenc_var, self.posenc_deg))
             net_output = emission_MLP(posenc(net_input / self.scale, self.posenc_deg))
             emission = nn.sigmoid(net_output[..., 0] - 10.0)
             emission = bhnerf.emission.fill_unsupervised_emission(emission, coords, self.rmin, self.rmax, self.z_width, use_jax=True)
@@ -213,6 +250,124 @@ class NeRF_Predictor(nn.Module):
         params = yaml.safe_load(Path(directory).joinpath(filename).read_text())
         return cls(**params)
 
+class GRID_Predictor(nn.Module):
+    """
+    Full function to predict emission at a time step.
+    
+    Parameters
+    ----------
+    scale: float, default=1.0       
+        scale of the domain; scales the NN inputs
+    rmin: float, default=0.0        
+        minimum radius for recovery
+    rmax: float, default=np.inf     
+        maximum radius for recovery
+    z_width: float, default=np.inf  
+        maximum width of the disk (M units)
+    grid_res: int, default=64
+    """
+    scale: float = 1.0
+    rmin: float = 0.0
+    rmax: float = np.inf
+    z_width: float = np.inf 
+    grid_res: int = 64 
+    
+    def init_params(self, raytracing_args, seed=1):
+        params = self.init(jax.random.PRNGKey(seed), 
+                           raytracing_args['t_start_obs'], 
+                           raytracing_args['t_start_obs'].unit, 
+                           raytracing_args['coords'], 
+                           raytracing_args['Omega'], 
+                           raytracing_args['t_start_obs'], 
+                           raytracing_args['t_geos'], 
+                           raytracing_args['t_injection'])['params']
+        return params.unfreeze() # TODO(pratul): this unfreeze feels sketchy
+
+    def init_state(self, params, num_iters=5000, lr_init=1e-4, lr_final=1e-6, lr_inject=None, checkpoint_dir=''):
+        
+        lr = optax.polynomial_schedule(lr_init, lr_final, 1, num_iters)
+        tx = optax.adam(learning_rate=lr)
+        
+        if lr_inject:
+            tx = optax.chain(
+                optax.masked(optax.adam(learning_rate=lr_inject), mask=flattened_traversal(lambda path, _: path[-1] == 't_injection')),
+                optax.masked(tx, mask=flattened_traversal(lambda path, _: path[-1] != 't_injection')),
+            )
+            
+        state = train_state.TrainState.create(apply_fn=self.apply, params=params, tx=tx)  
+               
+        # Restore saved checkpoint
+        state = checkpoints.restore_checkpoint(checkpoint_dir, state)
+
+        # Replicate state for multiple gpus
+        state = flax.jax_utils.replicate(state)
+        return state
+    
+    @nn.compact
+    def __call__(self, t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection):
+        """
+        Sample emission on given coordinates at specified times assuming a velocity model (Omega)
+        
+        Parameters
+        ----------
+        t_frames: array, 
+            Array of time for each image frame
+        t_units: astropy.units, 
+            Time units of t_frames.
+        coords: list of arrays, 
+            For 3D emission coords=[x, y, z] with each array shape=(nt, num_alpha, num_beta, ngeo)
+            alpha, beta are image coordinates. These arrays contain the ray integration points
+        Omega: array, 
+            Angular velocity array sampled along the coords points
+        t_start_obs: astropy.Quantity, default=None
+            Start time for observations, if None t_frames[0] is assumed to be start time.
+        t_geos: array, 
+            Time along each geodesic (ray). This is used to account for slow light (light travels at finite velocity).
+        t_injection: float, 
+            Time of hotspot injection in M units.
+
+        Returns
+        -------
+        emission: jnp.array,
+            An array with the emission points
+        """
+        grid_init = lambda rng, shape: jnp.ones(shape) * -10.
+        grid = self.param('grid', grid_init, (self.grid_res, self.grid_res, self.grid_res)) 
+        def predict_emission(t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection):
+            warped_coords = bhnerf.emission.velocity_warp_coords(
+                coords, Omega, t_frames, t_start_obs, t_geos, t_injection, t_units=t_units, use_jax=True
+            )
+            
+            # Zero emission prior to injection time
+            valid_inputs_mask = jnp.isfinite(warped_coords)
+            net_input = jnp.where(valid_inputs_mask, warped_coords, jnp.zeros_like(warped_coords))
+            net_input = jnp.moveaxis(net_input, -1, 0)
+            net_input = (net_input + self.scale) / (2*self.scale) * (self.grid_res - 1.)
+            net_output = jax.scipy.ndimage.map_coordinates(grid, net_input, order=1, cval=0.)
+            emission = nn.sigmoid(net_output - 10.)
+            emission = bhnerf.emission.fill_unsupervised_emission(emission, coords, self.rmin, self.rmax, self.z_width, use_jax=True)
+            emission = jnp.where(valid_inputs_mask[..., 0], emission, jnp.zeros_like(emission))
+            return emission
+        
+        t_injection_param = self.param('t_injection', lambda key, values: jnp.array(values, dtype=jnp.float32), t_injection)
+        emission = predict_emission(t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection_param)
+        return emission
+    
+    def save_params(self, directory, filename='GRID_Predictor_params.yml'):
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        params = self.__dict__.copy()
+        params.pop('_state', None)
+        params.pop('activation', None)
+        with open(directory.joinpath(filename), 'w') as yaml_file:
+            yaml.dump(params, yaml_file)
+        
+    @classmethod
+    def from_yml(cls, directory, filename='GRID_Predictor_params.yml'):
+        params = yaml.safe_load(Path(directory).joinpath(filename).read_text())
+        return cls(**params)
+
+    
 def image_plane_prediction(params, predictor_fn, t_frames, coords, Omega, J,
                            g, dtau, Sigma, t_start_obs, t_geos, t_injection, t_units):
     """

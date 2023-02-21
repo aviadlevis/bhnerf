@@ -138,7 +138,6 @@ def velocity_warp_coords(coords, Omega, t_frames, t_start_obs, t_geos, t_injecti
         t_frames = utils.expand_dims(t_frames, t_frames.ndim + Omega.ndim, -1, use_jax)
 
     # Convert time units to grid units
-    
     t_geos = (t_frames - t_start_obs)/GM_c3 + _np.array(t_geos)
     t_M = t_geos - t_injection
     
@@ -331,6 +330,16 @@ def normalize_stokes(movie, I_flux, P_flux, V_flux=None):
         movie[:,3]  *= V_flux / movie[:,3].sum(axis=(-1,-2)).mean()
     return movie
 
-def rotate_evpa(qu, angle, axis=0):
-    p = np.exp(2j*angle) * (np.take(qu, 0, axis) + 1j * np.take(qu, 1, axis))
-    return np.stack([p.real, p.imag], axis=axis)
+def rotate_evpa(stokes, angle, axis=0):
+    if stokes.shape[axis] == 2:
+        p = np.exp(2j*angle) * (np.take(stokes, 0, axis) + 1j * np.take(stokes, 1, axis))
+        stokes_rot = np.stack([p.real, p.imag], axis=axis)
+    elif stokes.shape[axis] == 3:
+        p = np.exp(2j*angle) * (np.take(stokes, 1, axis) + 1j * np.take(stokes, 2, axis))
+        stokes_rot = np.stack([np.take(stokes, 0, axis), p.real, p.imag], axis=axis)
+    elif stokes.shape[axis] == 4:
+        p = np.exp(2j*angle) * (np.take(stokes, 1, axis) + 1j * np.take(stokes, 2, axis))
+        stokes_rot = np.stack([np.take(stokes, 0, axis), p.real, p.imag, np.take(stokes, 3, axis)], axis=axis)
+    else:
+        raise AttributeError('Shape of stokes vector along axis={} not supported'.format(axis))
+    return stokes_rot
