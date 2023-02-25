@@ -164,7 +164,7 @@ class Optimizer(object):
     raytracing_args: OrderedDict, 
         dictionary with arguments used for ray tracing
     save_period: int, default=-1
-        Save checkpoint every `save_period` iterations. Negative value means every iteration.
+        Save checkpoint every `save_period` iterations. Negative value means last iteration only.
     save_period: str, default=''
         Checkpoint directory. '' means no checkpoint saved
     keep: int, default=5,

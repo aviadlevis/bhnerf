@@ -1,0 +1,52 @@
+# Configuration file for script Fit_ALMA_LP_Apr11_SgrA_Flare.py
+preprocess:
+    data_path: '../data/Apr11_HI.dat'    # path to ALMA April 11, 2017 Data (HI band)'
+    window_size: 8                       # window size for bin averaging
+    I_hs_mean: 0.3                       # mean hot-spot intensity [Jy]
+    P_sha: 0.16                          # fixed shadow polarization magnitude [Jy]
+    chi_sha: -37.0                       # fixed shadow polarization angle [deg]
+    de_rot_angle: 32.2                   # De-rotate Faraday angle [deg]
+    
+model:
+    # Domain dimensions and black-hole params
+    spin: 0.0                            # black hole spin
+    fov_M: 40.0                          # 3D fov [M]
+    z_width: 4                           # maximum disk width [M]
+    rmin: 'ISCO'                         # minimum recovery radius (`ISCO` or float [M])
+    recovery_scale: 1.0                  # feature scale for recovery [M]
+    
+    # Magnetic field / polarization parameters
+    Q_frac: 0.85                         # Fraction of linear polarization
+    b:                
+        arad: 0                          # Radial component (in lab-frame) 
+        avert: 1                         # Vertical component (in lab-frame)
+        ator: 0                          # Toroidal component (in lab-frame)   
+    
+    
+    # Keplerian velocity field
+    Omega_dir: 'cw'
+
+    # Image plane 
+    num_alpha: 64
+    num_beta: 64
+    
+    
+optimization:
+    # Logging / Saving
+    log_dir: '../runs/alma/intrinsic_fits/vertical_b'
+    checkpoint_dir: '../checkpoints/alma/intrinsic_fits/vertical_b'
+    log_period: 500
+    save_period: -1
+    
+    # Network / Optimization parameters
+    batchsize: 6
+    sigma: [0.15, 1e-2, 1e-2]   # standard deviation of [I, Q, U] in [Jy]
+    hparams: 
+        num_iters: 50000
+        lr_init: 1e-4
+        lr_final: 1e-6
+        seed: 4
+        
+    
+    
+    

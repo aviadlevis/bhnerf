@@ -235,7 +235,7 @@ def doppler_factor(geos, umu, fillna=0.0):
         g = g.fillna(fillna)
     return g
 
-def magnetic_field(geos, b_r, b_th, b_ph):
+def magnetic_field_spherical(geos, b_r, b_th, b_ph):
     """
     A spherical-coordinate magnetic field sampled on the geodesic coordinates 
     
@@ -258,6 +258,52 @@ def magnetic_field(geos, b_r, b_th, b_ph):
     if np.isscalar(b_ph): b_ph = xr.full_like(geos.mino, fill_value=b_ph)
     b = xr.concat([b_r, b_th, b_ph], dim='mu').transpose(...,'mu')
     return b
+
+def magnetic_field_fluid_frame(geos, umu, arad, avert, ator):
+    """
+    Define a lab-frame magnetic field and transform it to the fluid-frame (on the geodesic coordinates).
+    
+    Parameters
+    ----------
+    geos: xr.Dataset
+        Dataset with Kerr geodesics (see: `kerr_geodesics` for more details)
+    umu: xr.DataArray
+        array with contravarient velocity 4 vector (index up)
+    arad, avert, ator: floats
+        radial, vertical and toroidal components  
+        float defines a constant magnetic field component along the geodesics. 
+        An array should have the same dimensions as geos.
+        
+    Returns
+    -------
+    Bp: xr.DataArray,
+        Spherical-coordinate magnetic field sampled along the geodesics. component dim='mu'.
+    """
+    # Lab frame magnetic field: B
+    Br  = arad*np.sin(geos.theta)  + avert*np.cos(geos.theta)
+    Bth = avert*(-np.sin(geos.theta))
+    Bph = ator
+    
+    # Get fluid-frame b-field 4 vector b^mu
+    g_munu = spacetime_metric(geos)
+    u_mu = raise_or_lower_indices(g_munu, umu)
+    e_mu = fluid_frame_tetrad(geos, umu)
+
+    b0 = Br*u_mu.sel(mu=1) + Bth*u_mu.sel(mu=2) + Bph*u_mu.sel(mu=3)
+    b1 = (Br + b0*u_mu.sel(mu=1))/u_mu.sel(mu=0)
+    b2 = (Bth + b0*u_mu.sel(mu=2))/u_mu.sel(mu=0)
+    b3 = (Bph + b0*u_mu.sel(mu=3))/u_mu.sel(mu=0)  
+    b_mu = xr.concat([
+        g_munu.tt*b0 + g_munu.tph*b3, 
+        g_munu.rr*b1, 
+        g_munu.thth*b2,
+        g_munu.phph*b3 + g_munu.tph*b0], 
+        dim='mu', coords='minimal').transpose(...,'mu')
+
+    # Lab frame B --> comoving frame Bp
+    Bp = transform_coordinates(b_mu, e_mu, 'upper')[...,1:] # Remove time component
+
+    return Bp
 
 def fluid_frame_tetrad(geos, umu):
     """
@@ -391,7 +437,8 @@ def parallel_transport(geos, umu, g, b, Q_frac=0.2, V_frac=0.01, spectral_index=
     g: array, 
         doppler boosting factor.
     b: xr.DataArray,
-        Spherical-coordinate magnetic field sampled along the geodesics. component dim='mu'.
+        Spherical-coordinate magnetic field in the comoving frame 
+        sampled along the geodesics. component dim ('mu') is on the last axis=-1.
     Q_frac: float, default=0.2, 
         Scaling of Q with respect to I. Q_frac < 1.0
     spectral_index: int, default=1,
@@ -430,7 +477,7 @@ def parallel_transport(geos, umu, g, b, Q_frac=0.2, V_frac=0.01, spectral_index=
     #    - the magnetic field magnitude and pitch angle: b_mag, sin(theta_b)
     #    - doppler factor: g. 
     #    - spectral index: alpha
-    b_mag = np.array(np.sqrt((b**2).sum('mu')))
+    b_mag = np.array(np.sqrt((b**2).sum(axis=-1)))
     sin_th_b = np.sqrt((f_local**2).sum(axis=-1)) / np.sqrt((k_mu_prime**2).sum(axis=-1))
     cot_th_b = np.sqrt(1 - sin_th_b**2) / sin_th_b
     I = g**spectral_index * b_mag**(spectral_index+1) * sin_th_b**(spectral_index+1)
