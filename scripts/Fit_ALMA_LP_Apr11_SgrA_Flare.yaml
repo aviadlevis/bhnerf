@@ -22,7 +22,6 @@ model:
         avert: 1                         # Vertical component (in lab-frame)
         ator: 0                          # Toroidal component (in lab-frame)   
     
-    
     # Keplerian velocity field
     Omega_dir: 'cw'
 

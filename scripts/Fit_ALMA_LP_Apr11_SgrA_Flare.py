@@ -31,8 +31,10 @@ def preprocess_data(cfg):
 
     # Remove a constant Q,U shadow (accretion disk polarization) and de-rotate Faraday rotation
     # Set a prior on the hotspot intensity as a Gaussian
-    qu_sha = cfg['P_sha'] * np.array([np.cos(2*cfg['chi_sha']), np.sin(2*cfg['chi_sha'])])
-    target = bhnerf.emission.rotate_evpa(np.array(alma_lc_means[['Q','U']]) - qu_sha, cfg['de_rot_angle'], axis=1)
+    chi_sha = np.deg2rad(cfg['chi_sha'])
+    de_rot_angle = np.deg2rad(cfg['de_rot_angle'])
+    qu_sha = cfg['P_sha'] * np.array([np.cos(2*chi_sha), np.sin(2*chi_sha)])
+    target = bhnerf.emission.rotate_evpa(np.array(alma_lc_means[['Q','U']]) - qu_sha, de_rot_angle, axis=1)
     target = np.pad(target, ([0,0], [1,0]), constant_values=cfg['I_hs_mean'])
     return target, t_frames
 
@@ -45,6 +47,8 @@ def parse_args():
                              - second integer is index (starts at 0) \n\
                           example: \n\
                           `3 1` will split the 39 angles to 3 blocks of 13 angles and run the second block: 30-54 [deg].')
+    parser.add_argument('--start_inc', type=float, 
+                        help='Start after this angle.')
     parser.add_argument('--seeds', type=int, 
                         help='Number of seeds > 1 for initializing networks weights.')
     parser.add_argument('--gpu', type=int, nargs='+',
@@ -95,6 +99,10 @@ if __name__ == "__main__":
     if len(inc_grid) > 1:
         angles = np.arange(4, 82, 2, dtype=float)
         inc_grid = np.array_split(angles, args.inc[0])[args.inc[1]]
+    if args.start_inc:
+        inc_grid = inc_grid[inc_grid >= args.start_inc]
+    seeds = np.atleast_1d(hparams['seed'])
+    if args.seeds: seeds = range(args.seeds)
         
     for inclination in tqdm(inc_grid, desc='inc'):
         # Compute geodesics paths
@@ -119,15 +127,12 @@ if __name__ == "__main__":
         b /= b_mean
 
         # Polarized emission factors (including parallel transport)
-        de_rot_model = preproc_params['de_rot_angle'] + np.deg2rad(20.0)
+        de_rot_model = np.deg2rad(preproc_params['de_rot_angle'] + 20.0)
         J = np.nan_to_num(bhnerf.kgeo.parallel_transport(geos, umu, g, b, Q_frac=model_params['Q_frac'], V_frac=0), 0.0)
         J_rot = bhnerf.emission.rotate_evpa(J, de_rot_model)
 
         t_injection = -float(geos.r_o + model_params['fov_M']/4)
         raytracing_args = bhnerf.network.raytracing_args(geos, Omega, t_injection, t_frames[0], J_rot)
-        
-        seeds = np.atleast_1d(hparams['seed'])
-        if args.seeds: seeds = range(args.seeds)
             
         for seed in tqdm(seeds, desc='seed'):
             runname = basename.format(inclination, seed)
