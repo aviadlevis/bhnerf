@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from astropy import units
 import scipy.ndimage
 
-def generate_hotspot_xr(resolution, rot_axis, rot_angle, orbit_radius, std, r_isco, fov=(10.0, 'GM/c^2'), std_clip=np.inf, normalize=True):
+def generate_hotspot_xr(resolution, rot_axis, rot_angle, orbit_radius, std, r_isco, fov, std_clip=np.inf, normalize=True):
     """
     Generate an emission hotspot as a Gaussian xarray.DataArray.
 
@@ -53,10 +53,68 @@ def generate_hotspot_xr(resolution, rot_axis, rot_angle, orbit_radius, std, r_is
         center = np.matmul(rot_matrix, np.append(center_2d, 0.0))
         
     emission = utils.gaussian_xr(resolution, center, std, fov=fov, std_clip=std_clip)
-    if normalize: emission /= emission.max()
-    emission.attrs.update(rot_axis=rot_axis)
+    if normalize: emission /= emission.integrate(['x','y','z'])
+    emission.attrs.update(
+        rot_axis=rot_axis
+    )
     return emission
 
+def generate_tube_xr(resolution, rot_axis, phi_start, phi_end, orbit_radius, std, r_isco, fov, std_clip=np.inf, normalize=True):
+    """
+    Generate an emission tube with a Gaussian profile as an xarray.DataArray.
+
+    Parameters
+    ----------
+    resolution: int or nd-array,
+        Number of (x,y,z)-axis grid points.
+    rot_axis: 3d array/list/tuple,
+        The orbit rotation axis along which
+    phi_start: float, 
+        The start angle for the tube.
+    phi_end: float, 
+        The end angle for the tube.
+    orbit_radius: float, 
+        Radius of the orbit.
+    std: (stdx, stdy, stdz), or float,
+        Gaussian standard deviation in x,y,z directions. If scalar specified isotropic std is used.
+    r_isco: float,
+        Radius of the inner most stable circular orbit (ISCO). 
+    fov: (float, str), default=(1.0, 'unitless')
+        Field of view and units. Default is unitless 1.0.
+    std_clip: float, default=np.inf
+        Clip after this number of standard deviations
+    normalize: bool, default=True,
+        If True, normalize the maximum flux to 1.0. 
+        
+    Returns
+    -------
+    emission: xr.DataArray,
+        A DataArray with emission.
+    """
+    if orbit_radius < r_isco:
+        raise AttributeError('hotspot center ({}) is is within r_isco: {}'.format(orbit_radius, r_isco))
+
+    rot_axis = np.array(rot_axis) 
+    rot_axis = rot_axis / np.sqrt(np.sum(rot_axis**2))
+    z_axis = np.array([0, 0, 1])
+    rot_axis_prime = np.cross(z_axis, rot_axis)
+    if np.sqrt(np.sum(rot_axis_prime**2)) < 1e-5: rot_axis_prime = z_axis 
+    rot_angle_prime = np.arccos(np.dot(rot_axis, z_axis))
+    rot_matrix = utils.rotation_matrix(rot_axis_prime, rot_angle_prime)
+        
+    emission = 0
+    angles = np.arange(phi_start, phi_end, 0.015)
+    for phi in angles:
+        center_2d = orbit_radius * np.array([np.cos(phi), np.sin(phi)]) 
+        center = np.matmul(rot_matrix, np.append(center_2d, 0.0))
+        emission += utils.gaussian_xr(resolution, center, std, fov=fov, std_clip=std_clip)
+    if normalize: emission /= emission.integrate(['x','y','z'])
+    emission.attrs.update(
+        rot_axis=rot_axis,
+        phi_start=phi_start, 
+        phi_end=phi_end
+    )
+    return emission
 def equatorial_ring(geos, mbar):
     """
     Equatorial ring of emission

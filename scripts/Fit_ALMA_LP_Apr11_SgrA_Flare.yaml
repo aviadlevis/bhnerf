@@ -17,7 +17,7 @@ model:
     
     # Magnetic field / polarization parameters
     Q_frac: 0.85                         # Fraction of linear polarization
-    b:                
+    b_consts:                
         arad: 0                          # Radial component (in lab-frame) 
         avert: 1                         # Vertical component (in lab-frame)
         ator: 0                          # Toroidal component (in lab-frame)   
