@@ -369,9 +369,9 @@ def fill_unsupervised_emission(emission, coords, rmin=0, rmax=np.Inf, z_width=2.
     emission = _np.where(_np.abs(coords[2]) > z_width, _np.full_like(emission, fill_value=fill_value), emission)
     return emission
 
-def grf_to_image_plane(grf, geos, Omega, J, alpha=2.0, std_M=0.275, H_r=0.075):
+def grf_to_image_plane(grf, geos, Omega, J, diameter_M, alpha=2.0, H_r=0.075):
     fov_M = float(geos.alpha[-1]-geos.alpha[0])
-    gaussian = utils.gaussian_xr([grf.y.size, grf.x.size], [0,0], std=std_M).data
+    gaussian = utils.gaussian_xr([grf.y.size, grf.x.size], [0,0], std=diameter_M/2.355, fov=(fov_M, 'M')).data
     movie = np.exp(alpha*grf) * gaussian
     
     # Expand the 2D grf into 3D

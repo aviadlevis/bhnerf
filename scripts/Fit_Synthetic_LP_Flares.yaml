@@ -1,0 +1,22 @@
+# Configuration file for script Fit_synthetic_LP_Flares.py
+
+model:
+    # Domain dimensions and black-hole params
+    spin: 0.0                            # black hole spin
+    z_width: 4                           # maximum disk width [M]
+    rmin: 'ISCO'                         # minimum recovery radius
+    recovery_scale: 1.0                  # feature scale for recovery [M] 
+
+optimization:
+    # Logging / Saving
+    log_period: 500
+    save_period: -1
+
+    stokes: ['Q', 'U']
+    batchsize: 6
+    sigma: 1
+    hparams: 
+        num_iters: 50000
+        lr_init: 1e-4
+        lr_final: 1e-6 
+        seed: 1
