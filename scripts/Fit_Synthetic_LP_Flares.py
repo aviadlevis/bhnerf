@@ -19,7 +19,9 @@ warnings.simplefilter("ignore")
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('path', type=str, help='Path to data (CSV file).')
+    parser.add_argument('yaml_path', type=str, 
+                        help='Path to data configuration (.yaml) file. \n\
+                              The yaml file containts paths to lightcurve data (.csv) and ground-truth flare volume (.nc).')
     parser.add_argument('inc', type=int, nargs='+',
                     help='Inclination angle (if one argument is passed). \n\
                           If two arguments are passed then the 39 points in the angle range of [4 80] is split: \n\
@@ -47,9 +49,7 @@ if __name__ == "__main__":
     basename = 'inc_{:.1f}.seed_{}'
     
     args = parse_args()
-    data_path = Path(args.path)
-    lightcurves_df = pd.read_csv(data_path)
-    with open(data_path.parent.joinpath('sim1_params.yaml'), 'r') as stream:
+    with open(args.yaml_path, 'r') as stream:
         simulation_params = yaml.load(stream, Loader=yaml.Loader)
     with open(args.config_path, 'r') as stream:
         recovery_params = yaml.load(stream, Loader=yaml.Loader)
@@ -60,13 +60,16 @@ if __name__ == "__main__":
     rmax = fov_M / 2
     if rmin == 'ISCO': rmin = float(bhnerf.constants.isco_pro(spin))
     J_inds = [['I', 'Q', 'U'].index(s) for s in stokes]
-    recovery_params.update(rmax=rmax, rmin=rmin)
-    params = {'simulation': simulation_params, 'recovery': recovery_params}
-
+    recovery_params['model'].update(rmax=rmax, rmin=rmin)
+    
+    data_path = Path(simulation_params['lightcurve_path'])
+    lightcurves_df = pd.read_csv(data_path)
+    
     # Save recovery simulation parameters 
     sim_name = simulation_params['name']
     recovery_dir = data_path.parent.joinpath('recovery/{}'.format(sim_name))
     recovery_dir.mkdir(parents=True, exist_ok=True)
+    params = {'simulation': simulation_params, 'recovery': recovery_params}
     with open(recovery_dir.joinpath('params.yaml'), 'w') as file:
         yaml.dump(params, file, default_flow_style=False)
     

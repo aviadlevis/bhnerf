@@ -9,7 +9,7 @@ import jax
 from jax import numpy as jnp
 import functools
 
-def plot_stokes_lc(lightcurves, stokes, t_frames=None, axes=None, label=None, color=None, fmt='.', add_mean=False):
+def plot_stokes_lc(lightcurves, stokes, t_frames=None, axes=None, label=None, color=None, fmt='.', add_mean=False, plot_qu=False):
     
     num_stokes = len(stokes)
     if lightcurves.shape[1] != num_stokes:
@@ -17,15 +17,16 @@ def plot_stokes_lc(lightcurves, stokes, t_frames=None, axes=None, label=None, co
 
     t_frames = range(lightcurves.shape[0]) if t_frames is None else t_frames
     
-    num_axes = num_stokes
-    if 'Q' in stokes and 'U' in stokes: num_axes += 1
+    if not ('Q' in stokes and 'U' in stokes): plot_qu = False
     
     if axes is None:
+        num_axes = num_stokes
+        if plot_qu: num_axes += 1
         fig, axes = plt.subplots(1, num_axes, figsize=(3*num_axes,3))
+    else: 
+        num_axes = len(axes)
+        if num_axes == num_stokes: plot_qu = False
         
-    if len(axes) != num_axes:
-        raise AttributeError('axes lengths should be {}'.format(num_axes))
-
     for i in range(num_stokes):
         axes[i].set_title('{} lightcurve'.format(stokes[i]))
         axes[i].errorbar(t_frames, lightcurves[:, i], color=color, fmt=fmt, label=label)
@@ -33,7 +34,7 @@ def plot_stokes_lc(lightcurves, stokes, t_frames=None, axes=None, label=None, co
         if add_mean:
             axes[i].axhline(lightcurves[:,i].mean(), linestyle='--', color='r')
             
-    if 'Q' in stokes and 'U' in stokes:
+    if plot_qu:
         axes[-1].set_title('Q-U loop')
         axes[-1].scatter(lightcurves[0:,stokes.index('Q')], lightcurves[0:,stokes.index('U')], s=3, label=label)
     plt.tight_layout()

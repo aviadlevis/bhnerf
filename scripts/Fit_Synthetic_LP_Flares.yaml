@@ -14,7 +14,7 @@ optimization:
 
     stokes: ['Q', 'U']
     batchsize: 6
-    sigma: 1
+    sigma: 0.01
     hparams: 
         num_iters: 50000
         lr_init: 1e-4
