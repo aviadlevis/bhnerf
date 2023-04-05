@@ -1,16 +1,19 @@
 # Configuration file for script Fit_ALMA_LP_Apr11_SgrA_Flare.py
 preprocess:
-    data_path: '../data/Apr11_HI.dat'    # path to ALMA April 11, 2017 Data (HI band)'
+    data_path: '../data/Apr11_HI.dat'    # path to ALMA April 11, 2017 Data (HI band)
     window_size: 8                       # window size for bin averaging
     I_hs_mean: 0.3                       # mean hot-spot intensity [Jy]
     P_sha: 0.16                          # fixed shadow polarization magnitude [Jy]
     chi_sha: -37.0                       # fixed shadow polarization angle [deg]
     de_rot_angle: 32.2                   # De-rotate Faraday angle [deg]
+    t_start: 9.33                        # Crop observations from t_start [UTC]
+    t_end: 11.8                          # Crop observations to t_end [UTC]
     
 model:
     # Domain dimensions and black-hole params
     spin: 0.0                            # black hole spin
     fov_M: 40.0                          # 3D fov [M]
+    num_subrays: 10                      # Randomly sample rays within a pixel
     z_width: 4                           # maximum disk width [M]
     rmin: 'ISCO'                         # minimum recovery radius (`ISCO` or float [M])
     recovery_scale: 1.0                  # feature scale for recovery [M]
@@ -28,16 +31,17 @@ model:
     # Image plane 
     num_alpha: 64
     num_beta: 64
-    
+    t_start_obs: 9.34056333326589         # Canonical 3D volume time [Hrs]
     
 optimization:
     # Logging / Saving
-    log_dir: '../runs/alma/intrinsic_fits/vertical_b'
-    checkpoint_dir: '../checkpoints/alma/intrinsic_fits/vertical_b'
+    log_dir: '../runs/alma/intrinsic_fits/vertical_b_variable_pixels1'
+    checkpoint_dir: '../checkpoints/alma/intrinsic_fits/vertical_b_variable_pixels1'
     log_period: 500
     save_period: -1
     
     # Network / Optimization parameters
+    train_split: 103.0          # minutes 
     batchsize: 6
     sigma: [0.15, 1e-2, 1e-2]   # standard deviation of [I, Q, U] in [Jy]
     hparams: 

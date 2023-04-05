@@ -158,6 +158,7 @@ class NeRF_Predictor(nn.Module):
     do_skip: bool = True
     
     def init_params(self, raytracing_args, seed=1):
+        raytracing_args = np.atleast_1d(raytracing_args)[0]
         params = self.init(jax.random.PRNGKey(seed), 
                            raytracing_args['t_start_obs'], 
                            raytracing_args['t_start_obs'].unit, 

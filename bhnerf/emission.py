@@ -297,7 +297,11 @@ def image_plane_dynamics(emission_0, geos, Omega, t_frames, t_injection, J=1.0, 
         J = utils.expand_dims(J, emission.ndim+1, 0)
         emission = J * utils.expand_dims(emission, emission.ndim+1, 1)
         emission = np.squeeze(emission)
-    images = kgeo.radiative_trasfer(emission, np.array(g), np.array(geos.dtau), np.array(geos.Sigma))
+    
+    # compute flux denisties per pixel (assuming the integral is constant across a pixel fov).
+    dx = float((geos.alpha.max() - geos.alpha.min()) / geos.alpha.size)
+    dy = float((geos.beta.max() - geos.beta.min()) / geos.beta.size)
+    images = dx * dy * kgeo.radiative_trasfer(emission, np.array(g), np.array(geos.dtau), np.array(geos.Sigma))
     return images
 
 def propogate_flatspace_emission(emission_0, Omega_3D, t_frames, rot_axis=[0,0,1], M=consts.sgra_mass):

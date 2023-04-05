@@ -139,7 +139,7 @@ def total_movie_loss(batchsize, state, train_step, raytracing_args, return_frame
         total_loss += loss.sum()
         
         if return_frames:
-            frames.append(images.reshape(-1, *images.shape[2:]))
+            frames.append(images.reshape(-1, *images.shape[-3:]))
             
     output = total_loss / nt
     if return_frames:
@@ -241,6 +241,7 @@ class TrainStep(object):
     def __call__(self, state, raytracing_args, indices, update_state=True):
         total_loss = 0.0
         call_fn = self.grad_pmap if update_state == True else self.test_pmap
+        if isinstance(raytracing_args, list): raytracing_args = raytracing_args[np.random.choice(len(raytracing_args))]
         for i in range(self.num_losses):
             loss, state, images = call_fn[i](state, self.t_units, self.dtype[i], *self.args[i][indices], *raytracing_args.values(), self.scale[i])
             total_loss += loss
@@ -396,12 +397,12 @@ class SummaryWriter(tensorboardX.SummaryWriter):
         
         return log_fn
     
-    def plot_lc_datafit(self, opt, target, stokes, t_frames=None, batchsize=20):
+    def plot_lc_datafit(self, opt, name, train_step, target, stokes, t_frames=None, batchsize=20):
         
         plt.style.use('default')
-        
-        _, movie = bhnerf.optimization.total_movie_loss(
-            batchsize, opt.state, opt.train_step, opt.raytracing_args, return_frames=True
+        if isinstance(opt.raytracing_args, list): raytracing_args = opt.raytracing_args[np.random.choice(len(opt.raytracing_args))]
+        loss, movie = bhnerf.optimization.total_movie_loss(
+            batchsize, opt.state, train_step, raytracing_args, return_frames=True
         )
         lc_est = movie.sum(axis=(-1,-2))
         axes = bhnerf.visualization.plot_stokes_lc(target, stokes, t_frames, label='True')
@@ -410,8 +411,8 @@ class SummaryWriter(tensorboardX.SummaryWriter):
         for ax in axes:
             ax.legend()
             
-        self.add_figure('lightcurve/datafit', plt.gcf(), global_step=opt.step)
-
+        self.add_figure('lightcurve/{}'.format(name), plt.gcf(), global_step=opt.step)
+        self.add_scalar('datafit/{}'.format(name), np.log10(np.mean(loss)), global_step=opt.step)
     
 class LogFn(object):
     def __init__(self, log_fn, log_period=-1):

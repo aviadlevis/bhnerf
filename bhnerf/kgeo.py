@@ -4,7 +4,8 @@ import numpy as np
 from bhnerf import utils
 
 def image_plane_geos(spin, inclination, alpha_range, beta_range, ngeo=100, 
-                     num_alpha=64, num_beta=64, distance=1000.0, E=1.0, M=1.0, verbose=False):
+                     num_alpha=64, num_beta=64, distance=1000.0, E=1.0, M=1.0, 
+                     randomize_subpixel_rays=False, verbose=False):
     """
     Compute Kerr geodesics for the entire image plane 
     
@@ -30,6 +31,9 @@ def image_plane_geos(spin, inclination, alpha_range, beta_range, ngeo=100,
         Photon energy at infinity 
     M: float, default=1.0, 
         Black hole mass, taken as 1 (G=c=M=1)
+    randomize_subpixel_rays: bool, default=False,
+        Radomize ray position within the image plane over the pixel size.
+        If set to False, "center" position is taken.
         
     Returns
     -------
@@ -41,8 +45,16 @@ def image_plane_geos(spin, inclination, alpha_range, beta_range, ngeo=100,
     Overleaf notes: https://www.overleaf.com/project/60ff0ece5aa4f90d07f2a417
     units are in GM/c^2
     """
-    
-    alpha, beta = np.meshgrid(np.linspace(*alpha_range, num_alpha), np.linspace(*beta_range, num_beta), indexing='ij')
+    alpha_1d = np.linspace(*alpha_range, num_alpha)
+    beta_1d = np.linspace(*beta_range, num_beta)
+
+    if randomize_subpixel_rays:
+        psize_alpha = (alpha_range[1]-alpha_range[0]) / (num_alpha-1)
+        psize_beta = (beta_range[1]-beta_range[0]) / (num_beta-1)
+        alpha_1d += (np.random.random(num_alpha)-0.5) * psize_alpha
+        beta_1d += (np.random.random(num_beta)-0.5) * psize_beta
+
+    alpha, beta = np.meshgrid(alpha_1d, beta_1d, indexing='ij')
     image_coords = [alpha.ravel(), beta.ravel()]
     
     observer_coords = [0, distance, inclination, 0]
