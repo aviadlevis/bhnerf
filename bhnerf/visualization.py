@@ -538,7 +538,7 @@ class VolumeVisualizer(object):
             raise AttributeError('must set view before rendering')
     
         
-        cm = plt.get_cmap('hot') 
+        cm = plt.get_cmap(cmap) 
         emission_cm = cm(emission)
         emission_cm = jnp.clip(emission_cm - 0.05, 0.0, 1.0)
         emission_cm = jnp.concatenate([emission_cm[..., :3], emission[..., None] / jnp.amax(emission)], axis=-1)

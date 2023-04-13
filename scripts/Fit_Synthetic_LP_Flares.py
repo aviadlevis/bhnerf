@@ -75,7 +75,7 @@ if __name__ == "__main__":
     
     # Load ground truth flare for comparison 
     flare_path = Path(simulation_params['flare_path'])
-    emission_flare = xr.load_dataarray(flare_path)
+    emission_flare = emission_scale * xr.load_dataarray(flare_path)
 
     # Setup model for recovery
     target, t_frames = np.array(lightcurves_df[stokes]), np.array(lightcurves_df['t'])
