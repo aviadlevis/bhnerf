@@ -3,7 +3,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import animation
 from mpl_toolkits.axes_grid1 import make_axes_locatable
-from ipywidgets import interact
 from bhnerf.utils import normalize
 import jax
 from jax import numpy as jnp
@@ -59,6 +58,8 @@ def slider_frame_comparison(frames1, frames2, axis=0, scale='amp'):
     scale: 'amp' or 'log', default='amp'
         Compare absolute values or log of the fractional deviation.
     """
+    from ipywidgets import interact
+    
     fig, axes = plt.subplots(1, 3, figsize=(9, 3))
     plt.tight_layout()
     mean_images = [frames1.mean(axis=axis), frames2.mean(axis=axis),
@@ -354,6 +355,8 @@ class _VisualizationAccessor(object):
             The Colormap instance or registered colormap name used to map scalar data to colors.
             Defaults to :rc:`image.cmap`.
         """
+        from ipywidgets import interact
+        
         movie = self._obj.squeeze()
         if movie.ndim != 3:
             raise AttributeError('Movie dimensions ({}) different than 3'.format(movie.ndim))
