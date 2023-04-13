@@ -57,13 +57,23 @@ if __name__ == "__main__":
     locals().update(recovery_params['model'])
     locals().update(recovery_params['optimization']) 
     
+    # Preprocess / split data to train/validation
+    data_path = Path(simulation_params['lightcurve_path'])
+    lightcurves_df = pd.read_csv(data_path)
+    target, t_frames = np.array(lightcurves_df[stokes]), np.array(lightcurves_df['t'])*units.hr
+    train_idx = t_frames <= t_start_obs*units.hr + train_split*units.min
+    val_idx = t_frames > t_start_obs*units.hr + train_split*units.min
+    data_train, data_val  = target[train_idx], target[val_idx] 
+    t_train, t_val = t_frames[train_idx], t_frames[val_idx]
+    
+    # Setup model for recovery
     rmax = fov_M / 2
     if rmin == 'ISCO': rmin = float(bhnerf.constants.isco_pro(spin))
     J_inds = [['I', 'Q', 'U'].index(s) for s in stokes]
+    train_step = bhnerf.optimization.TrainStep.image(t_train, data_train, sigma, dtype='lc')
+    val_step = bhnerf.optimization.TrainStep.image(t_val, data_val, sigma, dtype='lc')
+    predictor = bhnerf.network.NeRF_Predictor(rmax, rmin, rmax, z_width, posenc_var=recovery_scale/fov_M)
     recovery_params['model'].update(rmax=rmax, rmin=rmin)
-    
-    data_path = Path(simulation_params['lightcurve_path'])
-    lightcurves_df = pd.read_csv(data_path)
     
     # Save recovery simulation parameters 
     sim_name = simulation_params['name']
@@ -77,11 +87,6 @@ if __name__ == "__main__":
     flare_path = Path(simulation_params['flare_path'])
     emission_flare = emission_scale * xr.load_dataarray(flare_path)
 
-    # Setup model for recovery
-    target, t_frames = np.array(lightcurves_df[stokes]), np.array(lightcurves_df['t'])
-    train_step = bhnerf.optimization.TrainStep.image(t_frames, target, sigma, dtype='lc')
-    predictor = bhnerf.network.NeRF_Predictor(rmax, rmin, rmax, z_width, posenc_var=recovery_scale/fov_M)
-    
     inc_grid = args.inc
     if len(inc_grid) > 1:
         angles = np.arange(4, 82, 2, dtype=float)
@@ -91,33 +96,37 @@ if __name__ == "__main__":
     seeds = args.seeds if args.seeds else np.atleast_1d(hparams['seed'])
         
     for inclination in tqdm(inc_grid, desc='inc'):
-        # Compute geodesics paths
-        geos = bhnerf.kgeo.image_plane_geos(
-            spin, np.deg2rad(inclination), 
-            num_alpha=num_alpha, num_beta=num_beta, 
-            alpha_range=[-fov_M/2, fov_M/2],
-            beta_range=[-fov_M/2, fov_M/2]
-        )
-        geos = geos.fillna(0.0)
-
-         # Keplerian velocity and Doppler boosting
-        rot_sign = {'cw': -1, 'ccw': 1}
-        Omega = rot_sign[Omega_dir] * np.sqrt(geos.M) / (geos.r**(3/2) + geos.spin * np.sqrt(geos.M))
-        umu = bhnerf.kgeo.azimuthal_velocity_vector(geos, Omega)
-        g = bhnerf.kgeo.doppler_factor(geos, umu)
-
-        # Magnitude normalized magnetic field in fluid-frame
-        b = bhnerf.kgeo.magnetic_field_fluid_frame(geos, umu, **b_consts)
-        domain = np.bitwise_and(np.bitwise_and(np.abs(geos.z) < z_width, geos.r > rmin), geos.r < rmax)
-        b_mean = np.sqrt(np.sum(b[domain]**2, axis=-1)).mean()
-        b /= b_mean
-
-        # Polarized emission factors (including parallel transport)
-        J = np.nan_to_num(bhnerf.kgeo.parallel_transport(geos, umu, g, b, Q_frac=Q_frac, V_frac=0), 0.0)[J_inds]
         
-        t_injection = -float(geos.r_o + fov_M/4)
-        raytracing_args = bhnerf.network.raytracing_args(geos, Omega, t_injection, t_start_obs*units.hr, J)
-        
+        raytracing_args = []
+        for ray in range(num_subrays):
+            # Compute geodesics paths
+            geos = bhnerf.kgeo.image_plane_geos(
+                spin, np.deg2rad(inclination), 
+                num_alpha=num_alpha, num_beta=num_beta, 
+                alpha_range=[-fov_M/2, fov_M/2],
+                beta_range=[-fov_M/2, fov_M/2]
+            )
+            geos = geos.fillna(0.0)
+
+             # Keplerian velocity and Doppler boosting
+            rot_sign = {'cw': -1, 'ccw': 1}
+            Omega = rot_sign[Omega_dir] * np.sqrt(geos.M) / (geos.r**(3/2) + geos.spin * np.sqrt(geos.M))
+            umu = bhnerf.kgeo.azimuthal_velocity_vector(geos, Omega)
+            g = bhnerf.kgeo.doppler_factor(geos, umu)
+
+            # Magnitude normalized magnetic field in fluid-frame
+            b = bhnerf.kgeo.magnetic_field_fluid_frame(geos, umu, **b_consts)
+            domain = np.bitwise_and(np.bitwise_and(np.abs(geos.z) < z_width, geos.r > rmin), geos.r < rmax)
+            b_mean = np.sqrt(np.sum(b[domain]**2, axis=-1)).mean()
+            b /= b_mean
+
+            # Polarized emission factors (including parallel transport)
+            J = np.nan_to_num(bhnerf.kgeo.parallel_transport(geos, umu, g, b, Q_frac=Q_frac, V_frac=0), 0.0)[J_inds]
+            t_injection = -float(geos.r_o + fov_M/4)
+            raytracing_args.append(
+                bhnerf.network.raytracing_args(geos, Omega, t_injection, t_start_obs*units.hr, J)
+            )
+            
         for seed in tqdm(seeds, desc='seed'):
             runname = basename.format(inclination, seed)
             writer = bhnerf.optimization.SummaryWriter(logdir=recovery_dir.joinpath(runname))
@@ -125,7 +134,8 @@ if __name__ == "__main__":
             log_fns = [
                 LogFn(lambda opt: writer.add_scalar('log_loss/train', np.log10(np.mean(opt.loss)), global_step=opt.step)), 
                 LogFn(lambda opt: writer.recovery_3d(fov_M, emission_true=emission_flare)(opt), log_period=log_period),
-                LogFn(lambda opt: writer.plot_lc_datafit(opt, target, stokes, t_frames, batchsize=20), log_period=log_period)
+                LogFn(lambda opt: writer.plot_lc_datafit(opt, 'training', train_step, data_train, stokes, t_train, batchsize=20), log_period=log_period),
+                LogFn(lambda opt: writer.plot_lc_datafit(opt, 'validation', val_step, data_val, stokes, t_val, batchsize=20), log_period=log_period)
             ]
             
             hparams['seed'] = seed

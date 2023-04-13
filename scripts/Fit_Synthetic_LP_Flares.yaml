@@ -12,10 +12,12 @@ optimization:
     log_period: 500
     save_period: -1
 
+    # Network / Optimization parameters
+    train_split: 103.0          # minutes 
     stokes: ['Q', 'U']
     batchsize: 6
     sigma: 0.01
-    hparams: 
+    hparams:                    # standard deviation of [I, Q, U] in [Jy]
         num_iters: 50000
         lr_init: 1e-4
         lr_final: 1e-6 
