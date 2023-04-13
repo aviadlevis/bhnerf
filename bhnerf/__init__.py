@@ -1,1 +1,7 @@
-from . import utils, emission, visualization, observation, network, optimization, constants, kgeo
+import warnings
+
+from . import utils, emission, visualization, network, optimization, constants, kgeo
+try:
+    from . import observation
+except ImportError:
+    warnings.warn("observation.py not imported. To use EHT observation install eht-imaging: https://github.com/achael/eht-imaging")
