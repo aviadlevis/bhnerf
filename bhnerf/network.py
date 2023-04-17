@@ -180,7 +180,7 @@ class NeRF_Predictor(nn.Module):
                 optax.masked(tx, mask=flattened_traversal(lambda path, _: path[-1] != 't_injection')),
             )
             
-        state = train_state.TrainState.create(apply_fn=self.apply, params=params, tx=tx)  
+        state = train_state.TrainState.create(apply_fn=self.apply, params=params, tx=tx) 
                
         # Restore saved checkpoint
         state = checkpoints.restore_checkpoint(checkpoint_dir, state)
@@ -240,9 +240,10 @@ class NeRF_Predictor(nn.Module):
     def save_params(self, directory, filename='NeRF_Predictor_params.yml'):
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
-        params = self.__dict__.copy()
-        params.pop('_state', None)
-        params.pop('activation', None)
+        param_keys = ['scale','rmin','rmax','z_width','posenc_deg','posenc_var','net_depth','net_width','out_channel','do_skip']
+        params = {}
+        for key, value in vars(self).items():
+            if key in param_keys: params.update({key: value})
         with open(directory.joinpath(filename), 'w') as yaml_file:
             yaml.dump(params, yaml_file)
         
@@ -357,9 +358,10 @@ class GRID_Predictor(nn.Module):
     def save_params(self, directory, filename='GRID_Predictor_params.yml'):
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
-        params = self.__dict__.copy()
-        params.pop('_state', None)
-        params.pop('activation', None)
+        param_keys = ['scale','rmin','rmax','z_width','posenc_deg','posenc_var','net_depth','net_width','out_channel','do_skip']
+        params = {}
+        for key, value in vars(self).items():
+            if key in param_keys: params.update({key: value})
         with open(directory.joinpath(filename), 'w') as yaml_file:
             yaml.dump(params, yaml_file)
         
