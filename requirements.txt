@@ -10,7 +10,7 @@ scikit-learn>=0.24.2
 tensorboard>=2.2.1
 tensorboardx>=2.4
 tqdm>=4.62.2
-flax>=0.3.4
+flax==0.3.4
 ipympl>=0.7.0
 tensorflow-gpu
 ipyvolume
