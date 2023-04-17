@@ -415,13 +415,14 @@ class SummaryWriter(tensorboardX.SummaryWriter):
         self.add_scalar('datafit/{}'.format(name), np.log10(np.mean(loss)), global_step=opt.step)
     
 class LogFn(object):
-    def __init__(self, log_fn, log_period=-1):
+    def __init__(self, log_fn, log_period=1):
         self.log_period = log_period
         self.log_fn = log_fn
         
     def __call__(self, optimizer):
-        if (optimizer.step == 1) or ((optimizer.step % self.log_period) == 0):
-            self.log_fn(optimizer)
+        if log_period > 0:
+            if (optimizer.step == 1) or ((optimizer.step % self.log_period) == 0):
+                self.log_fn(optimizer)
             
             
 def shard(xs):
