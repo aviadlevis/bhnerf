@@ -420,7 +420,7 @@ class LogFn(object):
         self.log_fn = log_fn
         
     def __call__(self, optimizer):
-        if log_period > 0:
+        if self.log_period > 0:
             if (optimizer.step == 1) or ((optimizer.step % self.log_period) == 0):
                 self.log_fn(optimizer)
             
