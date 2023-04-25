@@ -13,7 +13,7 @@ model:
     # Domain dimensions and black-hole params
     spin: 0.0                            # black hole spin
     fov_M: 40.0                          # 3D fov [M]
-    num_subrays: 10                      # Randomly sample rays within a pixel
+    # num_subrays: 10                    # Randomly sample rays within a pixel
     z_width: 4                           # maximum disk width [M]
     rmin: 'ISCO'                         # minimum recovery radius (`ISCO` or float [M])
     recovery_scale: 1.0                  # feature scale for recovery [M]

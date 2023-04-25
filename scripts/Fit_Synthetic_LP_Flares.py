@@ -97,39 +97,42 @@ if __name__ == "__main__":
         
     for inclination in tqdm(inc_grid, desc='inc'):
         
-        raytracing_args = []
-        for ray in range(num_subrays):
-            # Compute geodesics paths
-            geos = bhnerf.kgeo.image_plane_geos(
-                spin, np.deg2rad(inclination), 
-                num_alpha=num_alpha, num_beta=num_beta, 
-                alpha_range=[-fov_M/2, fov_M/2],
-                beta_range=[-fov_M/2, fov_M/2]
-            )
-            geos = geos.fillna(0.0)
+        # Compute geodesics paths
+        geos = bhnerf.kgeo.image_plane_geos(
+            spin, np.deg2rad(inclination), 
+            num_alpha=num_alpha, num_beta=num_beta, 
+            alpha_range=[-fov_M/2, fov_M/2],
+            beta_range=[-fov_M/2, fov_M/2],
+        )
+        geos = geos.fillna(0.0)
 
-             # Keplerian velocity and Doppler boosting
-            rot_sign = {'cw': -1, 'ccw': 1}
-            Omega = rot_sign[Omega_dir] * np.sqrt(geos.M) / (geos.r**(3/2) + geos.spin * np.sqrt(geos.M))
-            umu = bhnerf.kgeo.azimuthal_velocity_vector(geos, Omega)
-            g = bhnerf.kgeo.doppler_factor(geos, umu)
+         # Keplerian velocity and Doppler boosting
+        rot_sign = {'cw': -1, 'ccw': 1}
+        Omega = rot_sign[Omega_dir] * np.sqrt(geos.M) / (geos.r**(3/2) + geos.spin * np.sqrt(geos.M))
+        umu = bhnerf.kgeo.azimuthal_velocity_vector(geos, Omega)
+        g = bhnerf.kgeo.doppler_factor(geos, umu)
 
-            # Magnitude normalized magnetic field in fluid-frame
-            b = bhnerf.kgeo.magnetic_field_fluid_frame(geos, umu, **b_consts)
-            domain = np.bitwise_and(np.bitwise_and(np.abs(geos.z) < z_width, geos.r > rmin), geos.r < rmax)
-            b_mean = np.sqrt(np.sum(b[domain]**2, axis=-1)).mean()
-            b /= b_mean
+        # Magnitude normalized magnetic field in fluid-frame
+        b = bhnerf.kgeo.magnetic_field_fluid_frame(geos, umu, **b_consts)
+        domain = np.bitwise_and(np.bitwise_and(np.abs(geos.z) < z_width, geos.r > rmin), geos.r < rmax)
+        b_mean = np.sqrt(np.sum(b[domain]**2, axis=-1)).mean()
+        b /= b_mean
 
-            # Polarized emission factors (including parallel transport)
-            J = np.nan_to_num(bhnerf.kgeo.parallel_transport(geos, umu, g, b, Q_frac=Q_frac, V_frac=0), 0.0)[J_inds]
-            t_injection = -float(geos.r_o + fov_M/4)
-            raytracing_args.append(
-                bhnerf.network.raytracing_args(geos, Omega, t_injection, t_start_obs*units.hr, J)
-            )
-            
+        # Polarized emission factors (including parallel transport)
+        J = np.nan_to_num(bhnerf.kgeo.parallel_transport(geos, umu, g, b, Q_frac=Q_frac, V_frac=0), 0.0)[J_inds]
+        t_injection = -float(geos.r_o + fov_M/4)
+        raytracing_args = bhnerf.network.raytracing_args(geos, Omega, t_injection, t_start_obs*units.hr, J)
+
         for seed in tqdm(seeds, desc='seed'):
+            
+            # If already finished run --> skip iteration
             runname = basename.format(inclination, seed)
-            writer = bhnerf.optimization.SummaryWriter(logdir=recovery_dir.joinpath(runname))
+            checkpoint_dir = logdir = recovery_dir.joinpath(runname)
+            if os.path.exists(checkpoint_dir):
+                continue
+                
+            
+            writer = bhnerf.optimization.SummaryWriter(logdir=logdir)
             writer.add_images('emission/true', bhnerf.utils.intensity_to_nchw(emission_flare), global_step=0)
             log_fns = [
                 LogFn(lambda opt: writer.add_scalar('log_loss/train', np.log10(np.mean(opt.loss)), global_step=opt.step)), 
@@ -142,7 +145,7 @@ if __name__ == "__main__":
             optimizer = bhnerf.optimization.Optimizer(
                 hparams, predictor, raytracing_args, 
                 save_period=save_period, 
-                checkpoint_dir=recovery_dir.joinpath(runname)
+                checkpoint_dir=checkpoint_dir
             )
 
             optimizer.run(batchsize, train_step, raytracing_args, log_fns=log_fns)

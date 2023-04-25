@@ -240,11 +240,19 @@ class TrainStep(object):
 
     def __call__(self, state, raytracing_args, indices, update_state=True):
         total_loss = 0.0
-        call_fn = self.grad_pmap if update_state == True else self.test_pmap
-        if isinstance(raytracing_args, list): raytracing_args = raytracing_args[np.random.choice(len(raytracing_args))]
-        for i in range(self.num_losses):
-            loss, state, images = call_fn[i](state, self.t_units, self.dtype[i], *self.args[i][indices], *raytracing_args.values(), self.scale[i])
-            total_loss += loss
+        raytracing_args = np.atleast_1d(raytracing_args)
+        if update_state:
+            call_fn = self.grad_pmap 
+            raytracing_args = [raytracing_args[np.random.choice(len(raytracing_args))]]
+        else:
+            call_fn = self.test_pmap
+        
+        # Subpixel loop (stochastic subpixel selection for training)
+        for rt_arg in raytracing_args:
+            for i in range(self.num_losses):
+                loss, state, images = call_fn[i](state, self.t_units, self.dtype[i], *self.args[i][indices], *rt_arg.values(), self.scale[i])
+                total_loss += loss / len(raytracing_args)
+                
         return total_loss, state, images
     
     def __add__(self, other):
@@ -400,7 +408,8 @@ class SummaryWriter(tensorboardX.SummaryWriter):
     def plot_lc_datafit(self, opt, name, train_step, target, stokes, t_frames=None, batchsize=20):
         
         plt.style.use('default')
-        if isinstance(opt.raytracing_args, list): raytracing_args = opt.raytracing_args[np.random.choice(len(opt.raytracing_args))]
+        raytracing_args = np.atleast_1d(opt.raytracing_args)
+        raytracing_args = raytracing_args[np.random.choice(len(raytracing_args))]
         loss, movie = bhnerf.optimization.total_movie_loss(
             batchsize, opt.state, train_step, raytracing_args, return_frames=True
         )
