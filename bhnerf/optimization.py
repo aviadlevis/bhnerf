@@ -240,6 +240,7 @@ class TrainStep(object):
 
     def __call__(self, state, raytracing_args, indices, update_state=True):
         total_loss = 0.0
+        total_images = 0.0
         raytracing_args = np.atleast_1d(raytracing_args)
         if update_state:
             call_fn = self.grad_pmap 
@@ -252,8 +253,8 @@ class TrainStep(object):
             for i in range(self.num_losses):
                 loss, state, images = call_fn[i](state, self.t_units, self.dtype[i], *self.args[i][indices], *rt_arg.values(), self.scale[i])
                 total_loss += loss / len(raytracing_args)
-                
-        return total_loss, state, images
+                total_images += images / len(raytracing_args)
+        return total_loss, state, total_images
     
     def __add__(self, other):
         dtype = np.append(self.dtype, other.dtype)

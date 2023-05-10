@@ -304,7 +304,7 @@ def image_plane_dynamics(emission_0, geos, Omega, t_frames, t_injection, J=1.0, 
     images = dx * dy * kgeo.radiative_trasfer(emission, np.array(g), np.array(geos.dtau), np.array(geos.Sigma))
     return images
 
-def propogate_flatspace_emission(emission_0, Omega_3D, t_frames, rot_axis=[0,0,1], M=consts.sgra_mass):
+def propogate_flatspace_emission(emission_0, Omega_3D, t_frames, t_start_obs=None, rot_axis=[0,0,1], M=consts.sgra_mass):
     """
     Compute the 3D movie for a given initial emission in flat-space.
     
@@ -316,6 +316,8 @@ def propogate_flatspace_emission(emission_0, Omega_3D, t_frames, rot_axis=[0,0,1
         A dataarray specifying the keplerian velocity field in flat-space 3D coords (NOT GEODESICS)
     t_frames: array, 
         Array of time for each image frame with astropy.units
+    t_start_obs: astropy.Quantity, default=None
+        Start time for observations, if None t_frames[0] is assumed to be start time.
     rot_axis: array, default=[0, 0, 1]
         Currently only equitorial plane rotation is supported
     M: astropy.Quantity, default=constants.sgra_mass,
@@ -331,7 +333,7 @@ def propogate_flatspace_emission(emission_0, Omega_3D, t_frames, rot_axis=[0,0,1
         coords=[x, y, z],
         Omega=Omega_3D,
         t_frames=t_frames,
-        t_start_obs=np.atleast_1d(t_frames)[0], 
+        t_start_obs=np.atleast_1d(t_frames)[0] if t_start_obs is None else t_start_obs,
         t_geos=0,
         t_injection=0,
         rot_axis=rot_axis,

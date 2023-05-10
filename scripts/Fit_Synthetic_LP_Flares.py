@@ -78,6 +78,7 @@ if __name__ == "__main__":
     # Save recovery simulation parameters 
     sim_name = simulation_params['name']
     recovery_dir = data_path.parent.joinpath('recovery/{}'.format(sim_name))
+
     recovery_dir.mkdir(parents=True, exist_ok=True)
     params = {'simulation': simulation_params, 'recovery': recovery_params}
     with open(recovery_dir.joinpath('params.yaml'), 'w') as file:
@@ -131,14 +132,13 @@ if __name__ == "__main__":
             if os.path.exists(checkpoint_dir):
                 continue
                 
-            
             writer = bhnerf.optimization.SummaryWriter(logdir=logdir)
-            writer.add_images('emission/true', bhnerf.utils.intensity_to_nchw(emission_flare), global_step=0)
+            writer.add_images('emission/true', bhnerf.utils.intensity_to_nchw(emission_flare), dataformats='NCWH', global_step=0)
             log_fns = [
                 LogFn(lambda opt: writer.add_scalar('log_loss/train', np.log10(np.mean(opt.loss)), global_step=opt.step)), 
                 LogFn(lambda opt: writer.recovery_3d(fov_M, emission_true=emission_flare)(opt), log_period=log_period),
                 LogFn(lambda opt: writer.plot_lc_datafit(opt, 'training', train_step, data_train, stokes, t_train, batchsize=20), log_period=log_period),
-                LogFn(lambda opt: writer.plot_lc_datafit(opt, 'validation', val_step, data_val, stokes, t_val, batchsize=20), log_period=log_period)
+                # LogFn(lambda opt: writer.plot_lc_datafit(opt, 'validation', val_step, data_val, stokes, t_val, batchsize=20), log_period=log_period)
             ]
             
             hparams['seed'] = seed

@@ -111,7 +111,6 @@ if __name__ == "__main__":
             num_alpha=num_alpha, num_beta=num_beta, 
             alpha_range=[-fov_M/2, fov_M/2],
             beta_range=[-fov_M/2, fov_M/2],
-            randomize_subpixel_rays=True
         )
         geos = geos.fillna(0.0)
 
