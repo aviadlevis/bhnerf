@@ -35,7 +35,7 @@ def plot_stokes_lc(lightcurves, stokes, t_frames=None, axes=None, label=None, co
             
     if plot_qu:
         axes[-1].set_title('Q-U loop')
-        axes[-1].scatter(lightcurves[0:,stokes.index('Q')], lightcurves[0:,stokes.index('U')], s=3, label=label)
+        axes[-1].scatter(lightcurves[0:,stokes.index('Q')], lightcurves[0:,stokes.index('U')], s=3, label=label, color=color)
     plt.tight_layout()
     return axes
     
