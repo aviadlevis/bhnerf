@@ -233,8 +233,8 @@ class NeRF_Predictor(nn.Module):
             emission = jnp.where(valid_inputs_mask[..., 0], emission, jnp.zeros_like(emission))
             return emission
         
-        t_injection_param = self.param('t_injection', lambda key, values: jnp.array(values, dtype=jnp.float32), t_injection)
-        emission = predict_emission(t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection_param)
+        # t_injection_param = self.param('t_injection', lambda key, values: jnp.array(values, dtype=jnp.float32), t_injection)
+        emission = predict_emission(t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection)
         return emission
     
     def save_params(self, directory, filename='NeRF_Predictor_params.yml'):
@@ -351,8 +351,8 @@ class GRID_Predictor(nn.Module):
             emission = jnp.where(valid_inputs_mask[..., 0], emission, jnp.zeros_like(emission))
             return emission
         
-        t_injection_param = self.param('t_injection', lambda key, values: jnp.array(values, dtype=jnp.float32), t_injection)
-        emission = predict_emission(t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection_param)
+        # t_injection_param = self.param('t_injection', lambda key, values: jnp.array(values, dtype=jnp.float32), t_injection)
+        emission = predict_emission(t_frames, t_units, coords, Omega, t_start_obs, t_geos, t_injection)
         return emission
     
     def save_params(self, directory, filename='GRID_Predictor_params.yml'):
@@ -795,7 +795,7 @@ def test_eht(state, t_units, dtype, target, sigma, A, t_frames, coords, Omega, J
                                  t_start_obs, t_geos, t_injection, scale, t_units, dtype)
     return loss, state, images
        
-def sample_3d_grid(apply_fn, params, fov=None, coords=None, resolution=64, chunk=-1): 
+def sample_3d_grid(apply_fn, params, t_frame=0, t_start_obs=0, Omega=0, fov=None, coords=None, resolution=64, chunk=-1): 
     """
     Parameters
     ----------
@@ -803,6 +803,12 @@ def sample_3d_grid(apply_fn, params, fov=None, coords=None, resolution=64, chunk
         A coordinate-based neural net for predicting the emission values as a continuous function
     params: dict, 
         A dictionary with network parameters (from state.params)
+    t_frame: float / units.Quantity, 
+        time of frame with or without units
+    t_start_obs: astropy.Quantity, default=None
+        Start time for observations, if None 0 is assumed to be start time.
+    Omega: array, 
+        Angular velocity array sampled along the coords points
     fov: float, default=None
         Field of view. If None then coords need to be provided.
     coords: array(shape=(3,npoints)), optional, 
@@ -821,14 +827,21 @@ def sample_3d_grid(apply_fn, params, fov=None, coords=None, resolution=64, chunk
     elif (coords is None):
         raise AttributeError('Either coords or fov+resolution must be provided')
 
+    from astropy import units
+    t_units = t_frame.unit if isinstance(t_frame, units.Quantity) else None
+    
     # Get the a grid values sampled from the neural network
     resolution = coords.shape[-1]
     chunk = resolution if chunk < 0 else chunk
-    
+
     emission = []
     for c in range(resolution//chunk):
         coords_chunk = coords[:, c * chunk : (c + 1) * chunk, :, :]
-        emission.append(apply_fn({'params': params}, 0.0, None, coords_chunk, 0.0, 0.0, 0.0, 0.0))
+        if not np.isscalar(Omega): 
+            Omega_chunk = Omega[c * chunk : (c + 1) * chunk, :, :]
+        else:
+            Omega_chunk = Omega
+        emission.append(apply_fn({'params': params}, t_frame, t_units, coords_chunk, Omega_chunk, t_start_obs, 0.0, 0.0))
     emission = np.concatenate(emission, axis=0)
     return emission
 
