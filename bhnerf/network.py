@@ -815,12 +815,7 @@ def sample_3d_grid(apply_fn, params, t_frame=0, t_start_obs=0, Omega=0, fov=None
         Array of grid coordinates (x, y, z). If not specified, fov and resolution are used to grid the domain.
     resolution: int, default=64
         Grid resolution along [x,y,z].
-    """   
-    try:
-        params = jax.device_get(flax.jax_utils.unreplicate(params))
-    except IndexError:
-        params = jax.device_get(params)
-    
+    """
     if (coords is None) and (fov is not None):
         grid_1d = np.linspace(-fov/2, fov/2, resolution)
         coords = np.array(np.meshgrid(grid_1d, grid_1d, grid_1d, indexing='ij'))
