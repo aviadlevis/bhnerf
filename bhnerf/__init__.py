@@ -1,6 +1,7 @@
 import warnings
 
-from . import utils, emission, visualization, network, optimization, constants, kgeo
+from . import utils, emission, visualization, network, optimization, constants, kgeo, alma
+
 try:
     from . import observation
 except ImportError:
