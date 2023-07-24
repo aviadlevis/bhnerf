@@ -8,6 +8,39 @@ import jax
 from jax import numpy as jnp
 import functools
 
+def animate_chi2_3d(movie, chi2, figsize=(9,4), legend_loc='lower right', cmap='RdBu_r', fps=10, output=None, writer='ffmpeg'):
+
+    def animate_both(i):
+        return animate_frame(i), animate_plot(i)
+        
+    # Image animation function (called sequentially)
+    def animate_frame(i):
+        axes[0].set_title(r'Emission estimate: $\theta_o={:1.1f}$'.format(chi2.index[i]))
+        im.set_array(movie[i].clip(max=1))
+        return im
+    
+    def animate_plot(i):
+        line.set_xdata(chi2.index[i])
+        return line,
+
+    fig, axes = plt.subplots(1,2,figsize=figsize)
+    num_frames = len(movie)
+    
+    plot_chi2(chi2_inc, inc_true, False, axes[0])
+    line = axes[0].axvline(0, color='blue', linestyle='--', label='hypothesis')
+    axes[0].legend(loc=legend_loc)
+    axes[0].set_xlim(chi2.index[0], chi2.index[-1])
+    axes[1].set_title('Emission estimate')
+    axes[1].set_axis_off()
+    im =  axes[1].imshow(np.zeros_like(movie[0]))
+   
+    plt.tight_layout()
+    anim = animation.FuncAnimation(fig, animate_both, frames=num_frames, interval=1e3 / fps)
+
+    if output is not None:
+        anim.save(output, writer=writer, fps=fps)
+    return anim
+    
 def plot_stokes_lc(lightcurves, stokes, t_frames=None, axes=None, label=None, color=None, fmt='.', add_mean=False, plot_qu=False):
     
     num_stokes = len(stokes)

@@ -46,7 +46,7 @@ def parse_args():
 
 if __name__ == "__main__":
     
-    basename = 'inc_{:.1f}.seed_{}'
+    basename = 'inc_{:.1f}.seed_{}_test123'
     
     args = parse_args()
     with open(args.yaml_path, 'r') as stream:
@@ -56,6 +56,7 @@ if __name__ == "__main__":
     locals().update(simulation_params['model'])
     locals().update(recovery_params['model'])
     locals().update(recovery_params['optimization']) 
+    recovery_params['model'] = simulation_params['model'] | recovery_params['model']
     
     # Preprocess / split data to train/validation
     data_path = Path(simulation_params['lightcurve_path'])
@@ -69,7 +70,6 @@ if __name__ == "__main__":
     # Setup model for recovery
     rmax = fov_M / 2
     if rmin == 'ISCO': rmin = float(bhnerf.constants.isco_pro(spin))
-    J_inds = [['I', 'Q', 'U'].index(s) for s in stokes]
     train_step = bhnerf.optimization.TrainStep.image(t_train, data_train, sigma, dtype='lc')
     val_step = bhnerf.optimization.TrainStep.image(t_val, data_val, sigma, dtype='lc')
     predictor = bhnerf.network.NeRF_Predictor(rmax, rmin, rmax, z_width, posenc_var=recovery_scale/fov_M)
@@ -97,32 +97,8 @@ if __name__ == "__main__":
     seeds = args.seeds if args.seeds else np.atleast_1d(hparams['seed'])
         
     for inclination in tqdm(inc_grid, desc='inc'):
-        
-        # Compute geodesics paths
-        geos = bhnerf.kgeo.image_plane_geos(
-            spin, np.deg2rad(inclination), 
-            num_alpha=num_alpha, num_beta=num_beta, 
-            alpha_range=[-fov_M/2, fov_M/2],
-            beta_range=[-fov_M/2, fov_M/2],
-        )
-        geos = geos.fillna(0.0)
 
-         # Keplerian velocity and Doppler boosting
-        rot_sign = {'cw': -1, 'ccw': 1}
-        Omega = rot_sign[Omega_dir] * np.sqrt(geos.M) / (geos.r**(3/2) + geos.spin * np.sqrt(geos.M))
-        umu = bhnerf.kgeo.azimuthal_velocity_vector(geos, Omega)
-        g = bhnerf.kgeo.doppler_factor(geos, umu)
-
-        # Magnitude normalized magnetic field in fluid-frame
-        b = bhnerf.kgeo.magnetic_field_fluid_frame(geos, umu, **b_consts)
-        domain = np.bitwise_and(np.bitwise_and(np.abs(geos.z) < z_width, geos.r > rmin), geos.r < rmax)
-        b_mean = np.sqrt(np.sum(b[domain]**2, axis=-1)).mean()
-        b /= b_mean
-
-        # Polarized emission factors (including parallel transport)
-        J = np.nan_to_num(bhnerf.kgeo.parallel_transport(geos, umu, g, b, Q_frac=Q_frac, V_frac=0), 0.0)[J_inds]
-        t_injection = -float(geos.r_o + fov_M/4)
-        raytracing_args = bhnerf.network.raytracing_args(geos, Omega, t_injection, t_start_obs*units.hr, J)
+        raytracing_args = bhnerf.alma.get_raytracing_args(np.deg2rad(inclination), spin, recovery_params['model'], stokes)
 
         for seed in tqdm(seeds, desc='seed'):
             

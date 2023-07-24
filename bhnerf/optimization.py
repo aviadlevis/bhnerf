@@ -10,7 +10,7 @@ from tqdm.auto import tqdm
 import tensorboardX
 import matplotlib.pyplot as plt
 
-
+                         
 def total_movie_loss(batchsize, state, train_step, raytracing_args, return_frames=False):
     """
     This function chunks up the movie into frames which fit on GPUs and sums the total loss over all frames 
@@ -54,7 +54,7 @@ def total_movie_loss(batchsize, state, train_step, raytracing_args, return_frame
         
         if return_frames:
             # non polarized 
-            if np.isscalar(raytracing_args['J']): 
+            if np.isscalar(np.atleast_1d(raytracing_args)[0]['J']):
                 frames.append(images.reshape(-1, *images.shape[-2:]))
             else:
                 frames.append(images.reshape(-1, *images.shape[-3:]))
@@ -319,8 +319,7 @@ class SummaryWriter(tensorboardX.SummaryWriter):
             vis_coords = np.array(np.meshgrid(grid_1d, grid_1d, grid_1d, indexing='ij'))
             
         def log_fn(opt):
-            params = jax.device_get(flax.jax_utils.unreplicate(opt.state.params))
-            emission_grid = bhnerf.network.sample_3d_grid(opt.state.apply_fn, params, coords=vis_coords)
+            emission_grid = bhnerf.network.sample_3d_grid(opt.state.apply_fn, opt.params, coords=vis_coords)
             volume_slices = bhnerf.utils.intensity_to_nchw(emission_grid)
             self.add_images('emission/estimate', volume_slices, dataformats='NCWH', global_step=opt.step)
             if emission_true is not None:

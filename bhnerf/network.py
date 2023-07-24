@@ -90,7 +90,6 @@ def integrated_posenc(x, x_cov, max_deg, min_deg=0):
       jnp.concatenate([y, y + 0.5 * jnp.pi], axis=-1),
       jnp.concatenate([y_var] * 2, axis=-1))
 
-
 def expected_sin(x, x_var):
     # When the variance is wide, shrink sin towards zero.
     y = jnp.exp(-0.5 * x_var) * jnp.sin(x)
@@ -840,6 +839,14 @@ def sample_3d_grid(apply_fn, params, t_frame=0, t_start_obs=0, Omega=0, fov=None
     emission = np.concatenate(emission, axis=0)
     return emission
 
+def sample_checkpoint_3d(checkpoint_dir, t_frame=0, t_start_obs=0, Omega=0, fov=None, coords=None, resolution=64, chunk=-1):
+    predictor = bhnerf.network.NeRF_Predictor.from_yml(checkpoint_dir)
+    state = checkpoints.restore_checkpoint(checkpoint_dir, None)
+    emission = bhnerf.network.sample_3d_grid(
+        predictor.apply, state['params'], t_frame, t_start_obs, Omega, fov, coords, resolution, chunk
+    )
+    return emission
+    
 def raytracing_args(geos, Omega, t_injection, t_start_obs, J=1.0):
     """
     Return a list (ordered) with the ray tracing (non-optimized) arguments . 
@@ -886,6 +893,18 @@ def raytracing_args(geos, Omega, t_injection, t_start_obs, J=1.0):
 
     return raytracing_args
 
+def image_plane_checkpoint(raytracing_args, checkpoint_dir, t, rmin=0.0, rmax=np.inf, batchsize=20):
+    predictor = bhnerf.network.NeRF_Predictor.from_yml(checkpoint_dir)
+    predictor.rmax = min(rmax, predictor.rmax)
+    predictor.rmin = max(rmin, predictor.rmin)
+    params = predictor.init_params(raytracing_args)
+    state = predictor.init_state(params, checkpoint_dir=checkpoint_dir)
+    
+    num_stokes = np.atleast_1d(raytracing_args)[0]['J'].shape[0]
+    train_step = bhnerf.optimization.TrainStep.image(t, np.zeros((len(t), num_stokes)), dtype='lc')
+    _, image_plane = bhnerf.optimization.total_movie_loss(batchsize, state, train_step, raytracing_args, return_frames=True)
+    return image_plane
+    
 def tv_reg(apply_fn, params, coords):
     """
     Calculates a proxy for TV regularization which involves evaluating

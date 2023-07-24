@@ -16,24 +16,6 @@ import ruamel.yaml as yaml
 import warnings
 warnings.simplefilter("ignore")
 
-def preprocess_data(data_path, window_size, I_hs_mean, P_sha, chi_sha, de_rot_angle, t_start=9.33, t_end=11.05):
-    # Load data and temporally average 
-    # "loopy priod" between t0=9:20 UTC -- t7=11:03 [Weilgus et al. 2022]
-    alma_lc = pd.read_csv(data_path, index_col=0)
-    alma_lc_loops = alma_lc.loc[np.bitwise_and(alma_lc['time']>=t_start, alma_lc['time']<=t_end)]
-    alma_lc_means = alma_lc_loops.rolling(window_size).mean().loc[::window_size].dropna()
-
-    # drop points averaged between scans
-    alma_lc_means = alma_lc_means.where(alma_lc_means['time'].diff().fillna(0.0) < 160/3600).dropna()
-    t_frames = alma_lc_means['time'].values * units.hr
-
-    # Remove a constant Q,U shadow (accretion disk polarization) and de-rotate Faraday rotation
-    # Set a prior on the hotspot intensity as a Gaussian
-    qu_sha = P_sha * np.array([np.cos(2*np.deg2rad(chi_sha)), np.sin(2*np.deg2rad(chi_sha))])
-    target = bhnerf.emission.rotate_evpa(np.array(alma_lc_means[['Q','U']]) - qu_sha, np.deg2rad(de_rot_angle), axis=1)
-    target = np.pad(target, ([0,0], [1,0]), constant_values=I_hs_mean)
-    return target, t_frames
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('inc', type=int, nargs='+',
@@ -81,10 +63,10 @@ if __name__ == "__main__":
     locals().update(config['model'])
     locals().update(config['optimization'])
     
-    # Preprocess / split data to train/validation
-    target, t_frames = preprocess_data(**config['preprocess'])
-    train_idx = t_frames <= config['preprocess']['t_start']*units.hr + train_split*units.min
-    val_idx = t_frames > config['preprocess']['t_start']*units.hr + train_split*units.min
+    # Preprocess / split data in time into train/validation
+    target, t_frames = bhnerf.alma.preprocess_data(**config['preprocess'])
+    train_idx = t_frames <= t_start*units.hr + train_split*units.min
+    val_idx = t_frames > t_start*units.hr + train_split*units.min
     data_train, data_val  = target[train_idx], target[val_idx] 
     t_train, t_val = t_frames[train_idx], t_frames[val_idx]
     
@@ -93,7 +75,8 @@ if __name__ == "__main__":
     if rmin == 'ISCO': rmin = float(bhnerf.constants.isco_pro(spin))
     train_step = bhnerf.optimization.TrainStep.image(t_train, data_train, sigma, dtype='lc')
     val_step = bhnerf.optimization.TrainStep.image(t_val, data_val, sigma, dtype='lc')
-    predictor = bhnerf.network.NeRF_Predictor(rmax, rmin, rmax, z_width, posenc_var=recovery_scale/fov_M)
+    predictor = bhnerf.network.NeRF_Predictor(rmax, rmin, rmax, z_width)
+    rot_angle = np.deg2rad(de_rot_angle + 20.0)
     
     inc_grid = args.inc
     if len(inc_grid) > 1:
@@ -105,35 +88,8 @@ if __name__ == "__main__":
         
     for inclination in tqdm(inc_grid, desc='inc'):
         
-        # Compute geodesics paths
-        geos = bhnerf.kgeo.image_plane_geos(
-            spin, np.deg2rad(inclination), 
-            num_alpha=num_alpha, num_beta=num_beta, 
-            alpha_range=[-fov_M/2, fov_M/2],
-            beta_range=[-fov_M/2, fov_M/2],
-        )
-        geos = geos.fillna(0.0)
+        raytracing_args = bhnerf.alma.get_raytracing_args(np.deg2rad(inclination), spin, config['model'], rot_angle=rot_angle)
 
-         # Keplerian velocity and Doppler boosting
-        rot_sign = {'cw': -1, 'ccw': 1}
-        Omega = rot_sign[Omega_dir] * np.sqrt(geos.M) / (geos.r**(3/2) + geos.spin * np.sqrt(geos.M))
-        umu = bhnerf.kgeo.azimuthal_velocity_vector(geos, Omega)
-        g = bhnerf.kgeo.doppler_factor(geos, umu)
-
-        # Magnitude normalized magnetic field in fluid-frame
-        b = bhnerf.kgeo.magnetic_field_fluid_frame(geos, umu, **b_consts)
-        domain = np.bitwise_and(np.bitwise_and(np.abs(geos.z) < z_width, geos.r > rmin), geos.r < rmax)
-        b_mean = np.sqrt(np.sum(b[domain]**2, axis=-1)).mean()
-        b /= b_mean
-
-        # Polarized emission factors (including parallel transport)
-        de_rot_model = np.deg2rad(de_rot_angle + 20.0)
-        J = np.nan_to_num(bhnerf.kgeo.parallel_transport(geos, umu, g, b, Q_frac=Q_frac, V_frac=0), 0.0)
-        J_rot = bhnerf.emission.rotate_evpa(J, de_rot_model)
-
-        t_injection = -float(geos.r_o + fov_M/4)
-        raytracing_args = bhnerf.network.raytracing_args(geos, Omega, t_injection, t_start_obs*units.hr, J_rot) 
-            
         for seed in tqdm(seeds, desc='seed'):
             
              # If already finished run --> skip iteration
