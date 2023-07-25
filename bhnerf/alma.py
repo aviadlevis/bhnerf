@@ -44,8 +44,9 @@ def image_plane_model(inc, spin, params, rot_angle=0.0, randomize_subpixel_rays=
     )
     geos = geos.fillna(0.0)
     
-     # Keplerian velocity and Doppler boosting
-    Omega = rot_sign[Omega_dir] * np.sqrt(geos.M) / (geos.r**(3/2) + geos.spin * np.sqrt(geos.M))
+     # Keplerian velocity and Doppler boosting 
+    Omega_frac = params.get('Omega_frac', 1.0)
+    Omega = Omega_frac * rot_sign[Omega_dir] * np.sqrt(geos.M) / (geos.r**(3/2) + geos.spin * np.sqrt(geos.M))
     umu = bhnerf.kgeo.azimuthal_velocity_vector(geos, Omega)
     g = bhnerf.kgeo.doppler_factor(geos, umu)
     
@@ -71,7 +72,7 @@ def get_raytracing_args(inc, spin, params, stokes=['I','Q','U'], rot_angle=0.0, 
     else:
         randomize_rays = True
         ray_iteration = tqdm(range(num_subpixel_rays), leave=False, desc='subrays')
-        
+
     for i in ray_iteration:
         geos, Omega, J = image_plane_model(inc, spin, params, rot_angle, randomize_rays)
         t_injection = -float(geos.r_o + params['fov_M']/4)

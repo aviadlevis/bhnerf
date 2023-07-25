@@ -27,6 +27,7 @@ model:
     
     # Keplerian velocity field
     Omega_dir: 'cw'
+    Omega_frac: 1.0                      # Sub-Keplerian fraction (1 = Keplerian) 
 
     # Image plane 
     num_alpha: 64
