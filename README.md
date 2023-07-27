@@ -7,36 +7,30 @@ Geodesics (photon trajectories) are computed using [kgeo](https://github.com/ach
 Installation
 ---
 
-Clone bhnerf repository with the [kgeo](https://github.com/achael/kgeo) submodule
-```
-git clone --recurse-submodules https://github.com/aviadlevis/bhnerf.git
-cd bhnerf
-```
 
 Start a conda virtual environment and add channels
 ```
-conda create -n bhnerf
-conda activate bhnerf
-```
-If not added already add `conda-forge` and `anaconda` channels
-```
 conda config --add channels conda-forge
-conda config --add channels anaconda
+conda create -n jax python=3.9 numpy==1.23.1
+conda activate jax
 ```
 Install requirements 
 ```
-conda install --file requirements.txt
+pip install -r requirements.txt
 ```
 Install [`xarray`](http://xarray.pydata.org/) and its dependencies
 ```
 conda install -c conda-forge xarray dask netCDF4 bottleneck
 ```
-Install [`jax`](https://github.com/google/jax)
+
+Clone and install bhnerf with the [kgeo](https://github.com/achael/kgeo) submodule
 ```
-pip install --upgrade pip
-pip install --upgrade jax jaxlib>=0.1.69+cuda101 -f https://storage.googleapis.com/jax-releases/jax_releases.html
+git clone --recurse-submodules https://github.com/aviadlevis/bhnerf.git
+cd bhnerf/kgeo
+pip install .
+cd ../ 
+pip install .
 ```
-Note that in the line above the number next to cude should be replaced with version of the existing CUDA installation (see [GitHub issue](https://github.com/google/jax/issues/5231)), for example CUDA10.1 --> cuda101. You can find your CUDA version using `nvcc --version`
 
 Install [`eht-imaging`](https://achael.github.io/eht-imaging/)
 ```
@@ -45,15 +39,6 @@ git clone https://github.com/achael/eht-imaging.git
 cd eht-imaging
 pip install .
 cd ../
-``` 
-
-Install `bhnerf`
-```
-pip install .
-```
-Note currently [`kgeo`](https://github.com/achael/kgeo) requires an experimental [`scipy`](https://scipy.github.io/devdocs/release.1.8.0.html) version which has [elliptic integrals](https://scipy.github.io/devdocs/reference/special.html#module-scipy.special) implemented
-```
-pip install scipy==1.8.0rc4
 ```
 
 Getting Started
