@@ -16,8 +16,11 @@ conda activate jax
 ```
 Install requirements 
 ```
-pip install -r requirements.txt
+pip install numpy scipy matplotlib jupyterlab nodejs tqdm ipympl ipyvolume mpmath scikit-image ruamel.yaml
+pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+pip install flax optax diffrax scikit-learn tensorboardX tensorboard
 ```
+
 Install [`xarray`](http://xarray.pydata.org/) and its dependencies
 ```
 conda install -c conda-forge xarray dask netCDF4 bottleneck
